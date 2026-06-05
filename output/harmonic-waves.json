@@ -1,0 +1,119 @@
+{
+  "applied_compatibility_rules": [],
+  "candidate_seed": 17790135901244098704,
+  "content_id": "007c68e4e8280e931cf180315f573e802ad457fdf73dedc8ea49850ee4523c85",
+  "generated_at_utc": "2026-06-05T17:55:08.788146+00:00",
+  "generator": "harmonic-waves",
+  "height": 1000,
+  "master_seed": 42,
+  "palette": "forest-mist",
+  "pixelforge_version": "0.2.0",
+  "png_filename": "harmonic-waves.png",
+  "quality": {
+    "accepted": true,
+    "metrics": {
+      "center_border_balance": 0.4598366058052443,
+      "center_border_balance_score": 0.9196732116104887,
+      "clipped_black_ratio": 0.0,
+      "clipped_white_ratio": 0.0,
+      "color_diversity": 0.78125,
+      "edge_density": 0.0,
+      "edge_density_normalized": 0.0,
+      "horizontal_symmetry": 0.6067966383221707,
+      "luminance_contrast": 0.4148673760785779,
+      "mean_saturation": 0.3904862915019548,
+      "saturation_spread": 0.32433112603473235,
+      "vertical_symmetry": 1.0,
+      "visual_entropy": 0.680515554855654
+    },
+    "rejection_reasons": [],
+    "score": 0.5261586242571861
+  },
+  "rare_events": [],
+  "rarity": {
+    "information_bits": 7.988447112494839,
+    "summary": "Overall: Common (8.0 information bits total).",
+    "tier": "Common",
+    "trait_details": {
+      "frequency_set": {
+        "information_bits": 2.0,
+        "probability": 0.25,
+        "tier": "Common",
+        "value": "sqrt-roots"
+      },
+      "layer_count": {
+        "information_bits": 1.7369655941662063,
+        "probability": 0.3,
+        "tier": "Common",
+        "value": "3"
+      },
+      "rare_event:broken-symmetry": {
+        "information_bits": 0.01814734671025936,
+        "probability": 0.9875,
+        "tier": "Common",
+        "value": "absent"
+      },
+      "rare_event:luminous-halo": {
+        "information_bits": 0.0489096004809464,
+        "probability": 0.9666666666666667,
+        "tier": "Common",
+        "value": "absent"
+      },
+      "symmetry_mode": {
+        "information_bits": 3.321928094887362,
+        "probability": 0.1,
+        "tier": "Uncommon",
+        "value": "mirror-v"
+      },
+      "warp_stages": {
+        "information_bits": 0.862496476250065,
+        "probability": 0.55,
+        "tier": "Common",
+        "value": "1"
+      }
+    }
+  },
+  "recipe_schema_version": "1.0",
+  "recipe_traits": {
+    "accent_mode": "none",
+    "background_mode": "dark",
+    "candidate_seed": 17790135901244098704,
+    "complexity_level": "moderate",
+    "detail_level": "medium",
+    "generator_name": "harmonic-waves",
+    "generator_params": {
+      "freq_scale": 4.459556816409092,
+      "freq_set_name": "sqrt-roots",
+      "layer_count": 3,
+      "palette_phase_d": [
+        0.16336515301171328,
+        0.4133651530117133,
+        0.6633651530117133
+      ],
+      "phases": [
+        2.2135974818748725,
+        5.431066498448765,
+        6.199220254334273,
+        3.034817416886766,
+        1.1095110004011197
+      ],
+      "primary_frequency": 4.459556816409092,
+      "rotation": -2.2122345763230644,
+      "warp_freq_x": 4.891477230469171,
+      "warp_freq_y": 4.945547503820915,
+      "warp_stages": 1,
+      "warp_strength": 0.45979668535376605
+    },
+    "height": 1000,
+    "lighting_mode": "ambient",
+    "palette_name": "forest-mist",
+    "rare_events": [],
+    "retry_index": 0,
+    "schema_version": "1.0",
+    "seed": 42,
+    "symmetry_mode": "mirror-v",
+    "width": 1000
+  },
+  "retry_index": 0,
+  "width": 1000
+}

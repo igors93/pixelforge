@@ -3,6 +3,7 @@
 import argparse
 
 from pixel_forge import __version__
+from pixel_forge.cli.commands.animate import configure_animate_command
 from pixel_forge.cli.commands.explore import configure_explore_command
 from pixel_forge.cli.commands.generate import configure_generate_command
 from pixel_forge.cli.commands.inspect_seed import configure_inspect_seed_command
@@ -23,6 +24,7 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
     configure_generate_command(subparsers, settings)
+    configure_animate_command(subparsers)
     configure_list_generators_command(subparsers)
     configure_inspect_seed_command(subparsers, settings)
     configure_explore_command(subparsers, settings)
