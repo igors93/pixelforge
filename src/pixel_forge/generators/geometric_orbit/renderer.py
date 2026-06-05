@@ -7,18 +7,20 @@ from PIL import Image
 
 from pixel_forge.core.models import ImageSize
 from pixel_forge.generators.common.types import UInt8Array
-from pixel_forge.generators.geometric_orbit.parameters import GeometricOrbitParameters
+from pixel_forge.generators.geometric_orbit.parameters import (
+    GeometricOrbitParameters,
+)
 from pixel_forge.generators.geometric_orbit.shapes import (
     draw_center_disk,
     draw_panel,
     draw_shape,
 )
 
-_SUPERSAMPLE = 2
+_SUPERSAMPLE = 3
 
 
 class GeometricOrbitRenderer:
-    """Render clean geometric artwork with antialiasing and safe composition."""
+    """Render coherent geometric artwork with antialiasing and hierarchy."""
 
     def render(
         self,
@@ -31,7 +33,11 @@ class GeometricOrbitRenderer:
         height = size.height * scale
         shortest_side = min(width, height)
 
-        canvas = Image.new("RGBA", (width, height), (*recipe.palette.canvas, 255))
+        canvas = Image.new(
+            "RGBA",
+            (width, height),
+            (*recipe.palette.canvas, 255),
+        )
 
         for panel in recipe.panels:
             draw_panel(
@@ -42,17 +48,22 @@ class GeometricOrbitRenderer:
                 height=max(8, round(panel.height * height)),
                 rotation_degrees=panel.rotation_degrees,
                 color=panel.color,
-                corner_radius=max(2, round(panel.corner_radius * shortest_side)),
+                corner_radius=max(
+                    2,
+                    round(panel.corner_radius * shortest_side),
+                ),
                 shadow_color=recipe.palette.shadow,
                 shadow_opacity=panel.shadow_opacity,
+                opacity=panel.opacity,
             )
 
-        normalized_scale = shortest_side
         for shape in recipe.outer_shapes:
             draw_shape(
                 canvas,
                 shape=shape,
-                scale=normalized_scale,
+                scale=shortest_side,
+                canvas_width=width,
+                canvas_height=height,
                 shadow_color=recipe.palette.shadow,
             )
 
@@ -68,7 +79,10 @@ class GeometricOrbitRenderer:
             outline=recipe.palette.center_outline,
             highlight=recipe.palette.center_highlight,
             shadow=recipe.palette.shadow,
-            outline_width=max(2, round(recipe.center_outline_width * shortest_side)),
+            outline_width=max(
+                2,
+                round(recipe.center_outline_width * shortest_side),
+            ),
             shadow_opacity=recipe.center_shadow_opacity,
             highlight_strength=recipe.center_highlight_strength,
         )
@@ -77,7 +91,9 @@ class GeometricOrbitRenderer:
             draw_shape(
                 canvas,
                 shape=shape,
-                scale=normalized_scale,
+                scale=shortest_side,
+                canvas_width=width,
+                canvas_height=height,
                 shadow_color=recipe.palette.shadow,
             )
 
@@ -85,5 +101,4 @@ class GeometricOrbitRenderer:
             (size.width, size.height),
             resample=Image.Resampling.LANCZOS,
         )
-        array = np.asarray(resized, dtype=np.uint8)
-        return np.ascontiguousarray(array)
+        return np.ascontiguousarray(np.asarray(resized, dtype=np.uint8))

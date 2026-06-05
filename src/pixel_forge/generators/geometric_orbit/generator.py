@@ -11,7 +11,7 @@ from pixel_forge.generators.geometric_orbit.renderer import GeometricOrbitRender
 
 
 class GeometricOrbitGenerator(SeededArrayGenerator):
-    """Generate clean poster-like geometric compositions from a seed."""
+    """Generate poster-like compositions from a coherent shape grammar."""
 
     def __init__(self) -> None:
         self._renderer = GeometricOrbitRenderer()
