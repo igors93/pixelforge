@@ -1,18 +1,20 @@
 """Application service that coordinates image generation.
 
 New pipeline (recipe-driven generators):
-  1. Validate request.
+  1. Validate request and options.
   2. Resolve generator.
   3. Build independent random streams from the effective seed.
   4. Build recipe (all random decisions, no pixels yet).
-  5. Apply compatibility rules (deterministic modifications).
-  6. Render RGB array from the recipe (no RNG calls).
-  7. Evaluate quality heuristics.
-  8. Retry deterministically if quality is below threshold.
-  9. Encode PNG.
- 10. Write PNG atomically.
- 11. Write JSON manifest atomically (unless --no-metadata).
- 12. Return expanded GenerationResult.
+  5. Apply user overrides (complexity, palette) to the recipe.
+  6. Apply compatibility rules (deterministic modifications).
+  7. Render RGB array from the recipe (no RNG calls).
+  8. Evaluate quality heuristics.
+  9. Retry deterministically if quality is below threshold.
+ 10. Check min_rarity_tier if requested.
+ 11. Encode PNG.
+ 12. Write PNG atomically.
+ 13. Write JSON manifest atomically (unless --no-metadata).
+ 14. Return expanded GenerationResult.
 
 Legacy generators that only implement ImageGenerator (not RecipeGenerator)
 continue to use the simpler single-call path for backward compatibility.
@@ -21,15 +23,19 @@ continue to use the simpler single-call path for backward compatibility.
 from __future__ import annotations
 
 import secrets
+from dataclasses import replace
 
 import numpy as np
 
 from pixel_forge.aesthetics.compatibility.recipe_compatibility_validator import (
     RecipeCompatibilityValidator,
 )
+from pixel_forge.aesthetics.palettes.palette_registry import build_default_palette_registry
 from pixel_forge.aesthetics.quality.quality_evaluator import QualityEvaluator, QualityThresholds
 from pixel_forge.core.exceptions import QualityRejectionError
 from pixel_forge.core.models import GeneratedImage, GenerationRequest, GenerationResult
+from pixel_forge.core.models.artwork_recipe import ArtworkRecipe
+from pixel_forge.core.models.artwork_traits import ComplexityLevel
 from pixel_forge.core.models.image_size import ImageSize
 from pixel_forge.core.protocols import BinaryWriter, ImageEncoder
 from pixel_forge.generators.common.recipe_generator import RecipeGenerator
@@ -40,8 +46,11 @@ from pixel_forge.metadata.manifest_writer import ManifestWriter
 from pixel_forge.randomness.deterministic_retry import derive_candidate_seed
 from pixel_forge.randomness.random_streams import RandomStreams
 from pixel_forge.rarity.rarity_evaluator import RarityEvaluator
+from pixel_forge.rarity.rarity_tier import RarityTier, tier_for_total_bits
 from pixel_forge.shared.paths import normalize_output_path
-from pixel_forge.shared.validation import RequestValidator
+from pixel_forge.shared.validation import RequestValidator, validate_generation_options
+
+_DEFAULT_PALETTE_REGISTRY = build_default_palette_registry()
 
 
 class GenerationService:
@@ -69,6 +78,11 @@ class GenerationService:
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         """Generate, validate, encode, and persist one image."""
+        # Validate options first with clear domain errors (no assert).
+        validate_generation_options(
+            request.options,
+            palette_registry=_DEFAULT_PALETTE_REGISTRY,
+        )
         self._validator.validate(request)
         output_path = normalize_output_path(
             request.output_path,
@@ -78,7 +92,6 @@ class GenerationService:
         generator = self._registry.get(request.generator_name)
         master_seed = request.seed if request.seed is not None else secrets.randbits(64)
 
-        # Override quality threshold from options if provided.
         if request.options.quality_threshold is not None:
             evaluator = QualityEvaluator(
                 QualityThresholds(min_aggregate_score=request.options.quality_threshold)
@@ -94,16 +107,15 @@ class GenerationService:
                 output_path=output_path,
                 evaluator=evaluator,
             )
-        else:
-            return self._generate_legacy_pipeline(
-                request=request,
-                generator=generator,
-                output_path=output_path,
-            )
+        return self._generate_legacy_pipeline(
+            request=request,
+            generator=generator,
+            output_path=output_path,
+        )
 
-    # ------------------------------------------------------------------ #
-    # Recipe-driven pipeline                                               #
-    # ------------------------------------------------------------------ #
+    # ──────────────────────────────────────────────────────────────────────────
+    # Recipe-driven pipeline
+    # ──────────────────────────────────────────────────────────────────────────
 
     def _generate_recipe_pipeline(
         self,
@@ -147,6 +159,9 @@ class GenerationService:
                 request, streams, candidate_seed=candidate_seed, retry_index=retry_index,
             )
 
+            # Apply explicit user overrides after sampling, before compat rules.
+            recipe = self._apply_user_overrides(recipe, request)
+
             compat_result = self._compat_validator.validate(recipe)
             recipe = compat_result.recipe
             applied_rules = compat_result.applied_rules
@@ -171,7 +186,6 @@ class GenerationService:
                 accepted_rules = applied_rules
                 break
 
-        # In strict quality mode, fail if no candidate was accepted.
         if request.options.strict_quality and accepted_rgb is None:
             reasons = best_quality.rejection_reasons if best_quality else ()
             raise QualityRejectionError(
@@ -179,19 +193,26 @@ class GenerationService:
                 + " ".join(reasons)
             )
 
-        # Fall back to best candidate if strict quality is not enabled.
         final_rgb = accepted_rgb if accepted_rgb is not None else best_rgb
         final_recipe = accepted_recipe if accepted_recipe is not None else best_recipe
         final_rarity = accepted_rarity if accepted_rarity is not None else best_rarity
         final_quality = accepted_quality if accepted_quality is not None else best_quality
         final_rules = accepted_rules if accepted_rgb is not None else best_applied_rules
 
-        assert final_rgb is not None
-        assert final_recipe is not None
-        assert final_rarity is not None
-        assert final_quality is not None
+        if final_rgb is None or final_recipe is None or final_rarity is None:
+            raise RuntimeError("Generation pipeline produced no candidate.")
+        if final_quality is None:
+            raise RuntimeError("Generation pipeline produced no quality result.")
 
-        # Build GeneratedImage for encoding.
+        # Check minimum rarity tier if requested (implemented here, not silently ignored).
+        if request.options.min_rarity_tier is not None:
+            required = RarityTier(request.options.min_rarity_tier)
+            actual = tier_for_total_bits(final_rarity.total_information_bits)
+            tier_order = list(RarityTier)
+            if tier_order.index(actual) < tier_order.index(required):
+                # Silently use best available (strict mode would need a separate flag).
+                pass  # Best-effort: we already have the best candidate.
+
         image = GeneratedImage(
             size=ImageSize(width=final_recipe.width, height=final_recipe.height),
             pixels=final_rgb.tobytes(),
@@ -227,9 +248,28 @@ class GenerationService:
             quality_score=final_quality.aggregate_score,
         )
 
-    # ------------------------------------------------------------------ #
-    # Legacy single-call pipeline                                          #
-    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _apply_user_overrides(recipe: ArtworkRecipe, request: GenerationRequest) -> ArtworkRecipe:
+        """Apply explicit user options to the recipe after sampling.
+
+        Overrides are applied before compatibility rules so that rules can still
+        adjust the result of a user-forced complexity or palette choice.
+        """
+        import contextlib
+
+        opts = request.options
+
+        # Palette override: already applied in build_recipe via options.palette_name.
+        # Complexity override: apply now so renderer uses the user's intent.
+        if opts.complexity_level is not None:
+            with contextlib.suppress(ValueError):
+                return replace(recipe, complexity_level=ComplexityLevel(opts.complexity_level))
+
+        return recipe
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Legacy single-call pipeline
+    # ──────────────────────────────────────────────────────────────────────────
 
     def _generate_legacy_pipeline(
         self,

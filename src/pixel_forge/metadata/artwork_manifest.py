@@ -165,11 +165,15 @@ def _recipe_to_dict(recipe: ArtworkRecipe) -> dict[str, Any]:
 
 
 def _compute_content_id(recipe_dict: dict[str, Any], rgb_array: UInt8Array) -> str:
-    """Compute a SHA-256 content identifier from stable recipe data and pixel bytes."""
+    """Compute a SHA-256 content identifier from stable recipe data and all pixel bytes.
+
+    Using the complete raw RGB bytes (not a sample) ensures that two images
+    that differ in any single pixel produce distinct content IDs. The recipe
+    JSON provides a stable second input that ties the ID to the creative intent.
+    """
     stable_recipe = json.dumps(recipe_dict, sort_keys=True, ensure_ascii=False)
-    # Sample every 64th pixel to keep hashing fast even on large images.
-    pixel_sample = rgb_array.ravel()[::64].tobytes()
-    digest = hashlib.sha256(stable_recipe.encode() + pixel_sample).hexdigest()
+    all_pixels = rgb_array.tobytes()
+    digest = hashlib.sha256(stable_recipe.encode() + all_pixels).hexdigest()
     return digest
 
 

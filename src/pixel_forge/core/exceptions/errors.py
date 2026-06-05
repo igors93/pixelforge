@@ -39,3 +39,7 @@ class QualityRejectionError(PixelForgeError):
 
 class IncompatibleTraitsError(PixelForgeError):
     """Raised when user-supplied trait overrides are mutually incompatible."""
+
+
+class OptionsValidationError(PixelForgeError):
+    """Raised when user-supplied GenerationOptions contain invalid values."""

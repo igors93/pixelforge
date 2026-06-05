@@ -3,6 +3,10 @@
 Rules run in declaration order. Each rule receives the recipe returned by the
 previous rule, so later rules see modifications made by earlier ones. No rule
 introduces randomness; all decisions are deterministic given the recipe state.
+
+Each rule's activation condition is designed to be reachable by the values
+actually produced by the recipe builders. Thresholds are documented with the
+range of values each generator can produce.
 """
 
 from __future__ import annotations
@@ -20,11 +24,18 @@ from pixel_forge.core.models.artwork_traits import (
     BackgroundMode,
     ComplexityLevel,
     DetailLevel,
+    LightingMode,
+    SymmetryMode,
 )
 
 
 class _HighFrequencySimplePaletteRule:
-    """High geometric frequency forces palette or saturation downgrade."""
+    """High geometric frequency forces a complexity downgrade.
+
+    harmonic-waves produces primary_frequency in [4, 8] (freq_scale).
+    Threshold at 6.5 is reachable by ~25% of harmonic-waves recipes.
+    For INTRICATE recipes (layer_count ≥ 5), this reduces to COMPLEX.
+    """
 
     @property
     def name(self) -> str:
@@ -32,13 +43,19 @@ class _HighFrequencySimplePaletteRule:
 
     def apply(self, recipe: ArtworkRecipe) -> ArtworkRecipe:
         freq = float(recipe.generator_params.get("primary_frequency", 0.0))
-        if freq > 16.0 and recipe.complexity_level == ComplexityLevel.INTRICATE:
+        # Threshold 6.5 is within [4.0, 8.0] — reachable ~25% of the time.
+        if freq > 6.5 and recipe.complexity_level == ComplexityLevel.INTRICATE:
             return _replace(recipe, complexity_level=ComplexityLevel.COMPLEX)
         return recipe
 
 
 class _ManyPetalsReduceComplexityRule:
-    """More than 12 radial petals reduces secondary-layer complexity."""
+    """More than 12 radial petals reduces secondary-layer complexity.
+
+    radial-bloom produces petals ∈ {13, 17} with combined 2% probability.
+    Those recipes also set complexity_level=COMPLEX (petals > 9), so the
+    condition fires for all 13- and 17-petal recipes.
+    """
 
     @property
     def name(self) -> str:
@@ -62,8 +79,6 @@ class _BrokenSymmetryFocalPointRule:
         return "broken-symmetry-focal-point"
 
     def apply(self, recipe: ArtworkRecipe) -> ArtworkRecipe:
-        from pixel_forge.core.models.artwork_traits import SymmetryMode
-
         if (
             recipe.symmetry_mode == SymmetryMode.BROKEN
             and recipe.accent_mode == AccentMode.NONE
@@ -88,18 +103,23 @@ class _DarkBackgroundNeedsAccentRule:
         return recipe
 
 
-class _SaturatedPaletteReduceHighlightsRule:
-    """Highly saturated palettes reduce highlight intensity via lighting mode."""
+class _DirectionalLightingDowngradeRule:
+    """Directional lighting with a high layer count causes distracting shadows.
+
+    Replaces the original _SaturatedPaletteReduceHighlightsRule which used
+    palette_saturation_bias — a parameter no generator ever set.
+
+    harmonic-waves with layer_count ≥ 5 and DIRECTIONAL lighting gets
+    downgraded to AMBIENT so the many layers remain readable.
+    """
 
     @property
     def name(self) -> str:
-        return "saturated-palette-reduce-highlights"
+        return "directional-lighting-too-many-layers"
 
     def apply(self, recipe: ArtworkRecipe) -> ArtworkRecipe:
-        from pixel_forge.core.models.artwork_traits import LightingMode
-
-        sat = float(recipe.generator_params.get("palette_saturation_bias", 0.0))
-        if sat > 0.85 and recipe.lighting_mode == LightingMode.DIRECTIONAL:
+        layers = int(recipe.generator_params.get("layer_count", 0))
+        if layers >= 5 and recipe.lighting_mode == LightingMode.DIRECTIONAL:
             return _replace(recipe, lighting_mode=LightingMode.AMBIENT)
         return recipe
 
@@ -120,7 +140,12 @@ class _SmallDimensionReduceDetailRule:
 
 
 class _DeepFractalZoomIterationsRule:
-    """Deep fractal zoom requires more iterations for mandelbrot-dream."""
+    """Deep fractal zoom requires more iterations for mandelbrot-dream.
+
+    Zoom is in [zoom_min, zoom_max] per region — always reachable for high-zoom
+    regions (double-spiral: 15–80, needle-region: 20–100, etc.).
+    Fires when zoom > 5.0 and max_iterations < 256.
+    """
 
     @property
     def name(self) -> str:
@@ -139,7 +164,12 @@ class _DeepFractalZoomIterationsRule:
 
 
 class _StrongWarpReduceLayersRule:
-    """Strong domain warping reduces the number of competing wave layers."""
+    """Strong domain warping reduces the number of competing wave layers.
+
+    harmonic-waves produces warp_strength in [0.10, 0.55].
+    Threshold at 0.42 is reachable by ~20% of harmonic-waves recipes.
+    Fires when warp > 0.42 and layer_count > 4.
+    """
 
     @property
     def name(self) -> str:
@@ -150,7 +180,8 @@ class _StrongWarpReduceLayersRule:
             return recipe
         warp = float(recipe.generator_params.get("warp_strength", 0.0))
         layers = int(recipe.generator_params.get("layer_count", 4))
-        if warp > 0.60 and layers > 4:
+        # Threshold 0.42 is within [0.10, 0.55] — reachable ~20% of the time.
+        if warp > 0.42 and layers > 4:
             params = dict(recipe.generator_params)
             params["layer_count"] = 4
             return _replace(recipe, generator_params=params)
@@ -165,7 +196,6 @@ class _MultipleRareEventsLimitRule:
         return "multiple-rare-events-limit"
 
     def apply(self, recipe: ArtworkRecipe) -> ArtworkRecipe:
-        # Limit to at most 3 simultaneous rare events to preserve readability.
         if len(recipe.rare_events) > 3:
             return _replace(recipe, rare_events=recipe.rare_events[:3])
         return recipe
@@ -181,7 +211,7 @@ _DEFAULT_RULES: tuple[CompatibilityRule, ...] = (
     _ManyPetalsReduceComplexityRule(),
     _BrokenSymmetryFocalPointRule(),
     _DarkBackgroundNeedsAccentRule(),
-    _SaturatedPaletteReduceHighlightsRule(),
+    _DirectionalLightingDowngradeRule(),
     _SmallDimensionReduceDetailRule(),
     _DeepFractalZoomIterationsRule(),
     _StrongWarpReduceLayersRule(),

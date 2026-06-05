@@ -1,8 +1,15 @@
 """Plasma Flow: coherent multi-scale field generator with recipe-driven pipeline.
 
-Coherent value noise is synthesized from layered sine fields at different scales
-and orientations, avoiding independent per-pixel random noise. Two-stage domain
-warping and optional vortex distortions create organic, flowing plasma patterns.
+Every recipe trait produces a measurable pixel difference:
+  - palette_name      → full cosine_a/b/c/d coefficients
+  - lighting_mode     → Gaussian / directional / ambient brightness modulation
+  - background_mode   → edge vignette / light / void blend
+  - accent_mode       → highlight / spark / luminous halo overlay
+  - complexity_level  → warp stage cap
+  - warp_stages       → domain warp depth
+  - vortex_count      → curl distortions
+  - flow_direction    → phase offset by direction
+  - rare_events       → filament-surge and singularity visual transforms
 """
 
 from __future__ import annotations
@@ -24,14 +31,32 @@ from pixel_forge.core.models.artwork_traits import (
 )
 from pixel_forge.core.models.generation_request import GenerationRequest
 from pixel_forge.generators.common.base import SeededArrayGenerator
-from pixel_forge.generators.common.color import cosine_palette_to_rgb_bytes
 from pixel_forge.generators.common.fields import build_coordinate_field
+from pixel_forge.generators.common.rendering import (
+    apply_recipe_post_processing,
+    rgb_float_to_bytes,
+)
 from pixel_forge.generators.common.types import UInt8Array
+from pixel_forge.generators.plasma_flow.parameters import PlasmaFlowParams, VortexEntry
 from pixel_forge.randomness.random_streams import RandomStreams
 from pixel_forge.randomness.weighted_choice import WeightedChoice, sample_weighted
 from pixel_forge.rarity.trait_probability import TraitProbability
 
 _PALETTE_REGISTRY = build_default_palette_registry()
+
+# Complexity → max warp stages the renderer will apply.
+_COMPLEXITY_WARP_CAP: dict[ComplexityLevel, int] = {
+    ComplexityLevel.MINIMAL: 0,
+    ComplexityLevel.SIMPLE: 1,
+    ComplexityLevel.MODERATE: 1,
+    ComplexityLevel.COMPLEX: 2,
+    ComplexityLevel.INTRICATE: 2,
+}
+
+_RARE_EVENTS: dict[str, float] = {
+    "filament-surge": 1 / 40,
+    "singularity": 1 / 120,
+}
 
 
 class PlasmaFlowGenerator(SeededArrayGenerator):
@@ -106,7 +131,7 @@ class PlasmaFlowGenerator(SeededArrayGenerator):
             probability=flow_result.probability,
         ))
 
-        # --- Geometric parameters ---
+        # --- Geometry ---
         phases = [float(geom_rng.uniform(0.0, math.tau)) for _ in range(6)]
         center_x = float(geom_rng.uniform(-0.40, 0.40))
         center_y = float(geom_rng.uniform(-0.40, 0.40))
@@ -115,51 +140,54 @@ class PlasmaFlowGenerator(SeededArrayGenerator):
         warp_strength = float(geom_rng.uniform(0.10, 0.45))
         turbulence = float(geom_rng.uniform(0.0, 0.30))
 
-        # Vortex positions and strengths.
-        vortex_data: list[dict[str, float]] = []
+        vortex_entries: list[VortexEntry] = []
         for _ in range(vortex_count):
-            vortex_data.append({
-                "x": float(geom_rng.uniform(-0.6, 0.6)),
-                "y": float(geom_rng.uniform(-0.6, 0.6)),
-                "strength": float(geom_rng.uniform(0.15, 0.45)),
-                "sign": 1.0 if geom_rng.random() < 0.5 else -1.0,
-            })
+            vortex_entries.append(VortexEntry(
+                x=float(geom_rng.uniform(-0.6, 0.6)),
+                y=float(geom_rng.uniform(-0.6, 0.6)),
+                strength=float(geom_rng.uniform(0.15, 0.45)),
+                sign=1.0 if geom_rng.random() < 0.5 else -1.0,
+            ))
 
         # --- Palette ---
-        palette = _PALETTE_REGISTRY.sample(palette_rng, compatible_generator=self.name)
-        palette_name = palette.name
-        if request.options.palette_name:
-            palette_name = request.options.palette_name
+        sampled_palette = _PALETTE_REGISTRY.sample(palette_rng, compatible_generator=self.name)
+        palette_name = request.options.palette_name or sampled_palette.name
 
         phase_shift = float(streams.lighting.uniform(0.0, 1.0))
 
         # --- Rare events ---
         rare_events: list[str] = []
-        if float(rarity_rng.random()) < 1 / 40:
-            rare_events.append("filament-surge")
-        if float(rarity_rng.random()) < 1 / 120:
-            rare_events.append("singularity")
+        for event_name, prob in _RARE_EVENTS.items():
+            occurred = bool(rarity_rng.random() < prob)
+            if occurred:
+                rare_events.append(event_name)
+            trait_probs.append(TraitProbability(
+                trait_name=f"rare_event:{event_name}",
+                value="enabled" if occurred else "absent",
+                probability=prob if occurred else (1.0 - prob),
+            ))
 
+        # --- Derived recipe traits ---
         complexity_level = (
             ComplexityLevel.COMPLEX if warp_stages == 2 else
             ComplexityLevel.MODERATE if vortex_count > 0 else
             ComplexityLevel.SIMPLE
         )
 
-        params: dict[str, Any] = {
-            "warp_stages": warp_stages,
-            "vortex_count": vortex_count,
-            "flow_direction": flow_direction,
-            "phases": phases,
-            "center_x": center_x,
-            "center_y": center_y,
-            "freq_low": freq_low,
-            "freq_high": freq_high,
-            "warp_strength": warp_strength,
-            "turbulence": turbulence,
-            "vortex_data": vortex_data,
-            "palette_phase_shift": phase_shift,
-        }
+        params = PlasmaFlowParams(
+            warp_stages=warp_stages,
+            vortex_count=vortex_count,
+            flow_direction=flow_direction,
+            phases=tuple(phases),
+            center_x=center_x,
+            center_y=center_y,
+            freq_low=freq_low,
+            freq_high=freq_high,
+            warp_strength=warp_strength,
+            turbulence=turbulence,
+            vortex_data=tuple(vortex_entries),
+            palette_phase_shift=phase_shift,
+        )
 
         recipe = ArtworkRecipe(
             schema_version=RECIPE_SCHEMA_VERSION,
@@ -177,7 +205,7 @@ class PlasmaFlowGenerator(SeededArrayGenerator):
             lighting_mode=LightingMode.AMBIENT,
             accent_mode=AccentMode.NONE,
             rare_events=tuple(rare_events),
-            generator_params=params,
+            generator_params=params.to_dict(),
         )
         return recipe, trait_probs
 
@@ -187,93 +215,104 @@ class PlasmaFlowGenerator(SeededArrayGenerator):
 
         size = ImageSize(width=recipe.width, height=recipe.height)
         field = build_coordinate_field(size)
+        p = PlasmaFlowParams.from_dict(recipe.generator_params)
 
-        p = recipe.generator_params
-        warp_stages = int(p["warp_stages"])
-        phases: list[float] = list(p["phases"])
-        center_x = float(p["center_x"])
-        center_y = float(p["center_y"])
-        freq_low = float(p["freq_low"])
-        freq_high = float(p["freq_high"])
-        warp_strength = float(p["warp_strength"])
-        turbulence = float(p["turbulence"])
-        vortex_data: list[dict[str, float]] = list(p.get("vortex_data", []))
-        phase_shift = float(p["palette_phase_shift"])
-
-        ph = phases + [0.0] * 6  # pad so index access is safe
+        ph = list(p.phases) + [0.0] * 6  # pad for safe index access
 
         shifted_radius = np.hypot(
-            field.x_centered - center_x,
-            field.y_centered - center_y,
+            field.x_centered - p.center_x,
+            field.y_centered - p.center_y,
         )
 
-        # Base multi-scale sine field (coherent, not per-pixel random).
+        # Flow direction applies a phase bias to the base field.
+        direction_bias = {
+            "radial": 0.0,
+            "diagonal": 0.5,
+            "horizontal": 1.0,
+            "turbulent": 1.5,
+        }.get(p.flow_direction, 0.0)
+
         plasma = (
-            np.sin(field.x_unit * freq_low * math.pi + ph[0])
-            + np.sin(field.y_unit * freq_low * math.pi + ph[1])
-            + np.sin((field.x_unit + field.y_unit) * freq_high * math.pi + ph[2])
-            + np.sin(shifted_radius * freq_high * 0.85 + ph[3])
+            np.sin(field.x_unit * p.freq_low * math.pi + ph[0] + direction_bias)
+            + np.sin(field.y_unit * p.freq_low * math.pi + ph[1] + direction_bias * 0.7)
+            + np.sin(
+                (field.x_unit + field.y_unit) * p.freq_high * math.pi + ph[2] + direction_bias
+            )
+            + np.sin(shifted_radius * p.freq_high * 0.85 + ph[3])
         ) / 4.0
 
-        # Domain warp (stage 1).
+        # complexity_level caps the effective warp stages.
+        warp_cap = _COMPLEXITY_WARP_CAP.get(recipe.complexity_level, 2)
+        effective_warp = min(p.warp_stages, warp_cap)
+
         wx, wy = field.x_centered, field.y_centered
-        if warp_stages >= 1:
-            warp_y = warp_strength * np.sin(field.y_unit * freq_low * math.pi + ph[4])
-            warp_x = warp_strength * np.cos(field.x_unit * freq_low * math.pi + ph[5])
+        if effective_warp >= 1:
+            warp_y = p.warp_strength * np.sin(field.y_unit * p.freq_low * math.pi + ph[4])
+            warp_x = p.warp_strength * np.cos(field.x_unit * p.freq_low * math.pi + ph[5])
             wx = field.x_centered + warp_y
             wy = field.y_centered + warp_x
 
-        # Vortex curl-like displacement.
-        for vd in vortex_data:
-            vx = float(vd["x"])
-            vy = float(vd["y"])
-            strength = float(vd["strength"])
-            sign = float(vd["sign"])
-            dx = wx - vx
-            dy = wy - vy
+        for vd in p.vortex_data:
+            dx = wx - vd.x
+            dy = wy - vd.y
             r2 = dx * dx + dy * dy + 0.01
-            curl_x = -sign * dy / r2 * strength
-            curl_y = sign * dx / r2 * strength
-            r2_warped = np.hypot(wx + curl_x - (field.x_centered - center_x),
-                                 wy + curl_y - (field.y_centered - center_y))
-            vortex_contribution = np.sin(r2_warped * freq_low * 2.0 + ph[0])
-            plasma = plasma + 0.15 * vortex_contribution / max(len(vortex_data), 1)
+            curl_x = -vd.sign * dy / r2 * vd.strength
+            curl_y = vd.sign * dx / r2 * vd.strength
+            vortex_r = np.hypot(
+                wx + curl_x - (field.x_centered - p.center_x),
+                wy + curl_y - (field.y_centered - p.center_y),
+            )
+            vortex_contribution = np.sin(vortex_r * p.freq_low * 2.0 + ph[0])
+            plasma = plasma + 0.15 * vortex_contribution / max(len(p.vortex_data), 1)
 
-        # Stage 2 warp adds turbulence.
-        if warp_stages >= 2 and turbulence > 0:
-            plasma = plasma + turbulence * np.sin(
-                wx * freq_high * math.pi * 0.5 + wy * freq_high * math.pi * 0.5 + ph[2]
+        if effective_warp >= 2 and p.turbulence > 0:
+            plasma = plasma + p.turbulence * np.sin(
+                wx * p.freq_high * math.pi * 0.5 + wy * p.freq_high * math.pi * 0.5 + ph[2]
             )
 
-        # Filament surge rare event: amplify thin bright streaks.
         if "filament-surge" in recipe.rare_events:
             angle_field = np.arctan2(field.y_centered, field.x_centered)
-            filament = np.sin(angle_field * 12.0 + shifted_radius * freq_high * 0.4) ** 8
+            filament = np.sin(angle_field * 12.0 + shifted_radius * p.freq_high * 0.4) ** 8
             plasma = plasma + 0.20 * filament
 
         palette_position = np.clip(0.5 + 0.5 * plasma + 0.08 * shifted_radius, 0.0, 1.0)
-        brightness = 0.46 + 0.54 * (0.5 + 0.5 * np.cos(plasma * math.pi + shifted_radius * 1.5))
+        brightness = np.clip(
+            0.46 + 0.54 * (0.5 + 0.5 * np.cos(plasma * math.pi + shifted_radius * 1.5)), 0.0, 1.0
+        )
 
-        # Singularity: punch a dark hole at the center.
         if "singularity" in recipe.rare_events:
             singularity_mask = np.exp(-(shifted_radius**2) / 0.008)
             brightness = np.clip(brightness * (1.0 - 0.9 * singularity_mask), 0.0, 1.0)
 
-        try:
-            palette = _PALETTE_REGISTRY.get(recipe.palette_name)
-            phase_d = (
-                palette.cosine_d[0] + phase_shift,
-                palette.cosine_d[1] + phase_shift,
-                palette.cosine_d[2] + phase_shift,
-            )
-            palette_c = palette.cosine_c
-        except Exception:
-            phase_d = (phase_shift, phase_shift + 0.18, phase_shift + 0.52)
-            palette_c = (1.0, 1.1, 0.9)
+        # Full cosine palette with palette phase shift baked into cosine_d.
+        palette = _PALETTE_REGISTRY.get(recipe.palette_name)
+        import math as _math
 
-        return cosine_palette_to_rgb_bytes(
-            palette_position,
-            phase=phase_d,
-            frequency=palette_c,
-            brightness=brightness,
+        import numpy as _np
+        a = _np.asarray(palette.cosine_a, dtype=_np.float64)
+        b = _np.asarray(palette.cosine_b, dtype=_np.float64)
+        c = _np.asarray(palette.cosine_c, dtype=_np.float64)
+        d = _np.asarray([
+            palette.cosine_d[0] + p.palette_phase_shift,
+            palette.cosine_d[1] + p.palette_phase_shift,
+            palette.cosine_d[2] + p.palette_phase_shift,
+        ], dtype=_np.float64)
+        t = palette_position[..., _np.newaxis]
+        rgb_float = a + b * _np.cos(_math.tau * (t * c + d))
+        rgb_float = rgb_float * _np.clip(brightness, 0.0, 1.0)[..., _np.newaxis]
+
+        rgb_float = apply_recipe_post_processing(
+            rgb_float,
+            radius=shifted_radius,
+            x=field.x_centered,
+            y=field.y_centered,
+            lighting_mode=recipe.lighting_mode,
+            background_mode=recipe.background_mode,
+            accent_mode=recipe.accent_mode,
+            palette=palette,
         )
+
+        return rgb_float_to_bytes(rgb_float)
+
+    def _get_recipe_params(self, recipe: ArtworkRecipe) -> dict[str, Any]:
+        return dict(recipe.generator_params)

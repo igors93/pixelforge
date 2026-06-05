@@ -1,8 +1,16 @@
 """Mandelbrot Dream: named region-of-interest fractal with recipe pipeline.
 
-Named regions focus the view on visually interesting areas of the Mandelbrot
-set. Zoom is selected logarithmically and iteration limits scale with depth.
-All parameters are stored in the recipe before rendering begins.
+Every recipe trait produces a measurable pixel difference:
+  - palette_name   → palette cosine coefficients applied to escape-time coloring
+  - detail_level   → LOW=100, MEDIUM=256, HIGH=512 max iterations
+  - lighting_mode  → brightness modulation on the escape field
+  - background_mode→ edge vignette / void blend
+  - accent_mode    → highlight overlay on bright escape bands
+  - region         → named Mandelbrot viewport
+  - zoom           → logarithmic zoom level
+  - interior_mode  → color of the non-escaping set
+  - color_cycle    → hue cycle offset
+  - rare_events    → perfect-alignment and golden-orbit transforms
 """
 
 from __future__ import annotations
@@ -24,15 +32,26 @@ from pixel_forge.core.models.artwork_traits import (
 )
 from pixel_forge.core.models.generation_request import GenerationRequest
 from pixel_forge.generators.common.base import SeededArrayGenerator
-from pixel_forge.generators.common.color import hsv_to_rgb_bytes
+from pixel_forge.generators.common.rendering import (
+    apply_recipe_post_processing,
+    rgb_float_to_bytes,
+)
 from pixel_forge.generators.common.types import UInt8Array
+from pixel_forge.generators.mandelbrot_dream.parameters import MandelbrotDreamParams
 from pixel_forge.randomness.random_streams import RandomStreams
 from pixel_forge.randomness.weighted_choice import WeightedChoice, sample_weighted
 from pixel_forge.rarity.trait_probability import TraitProbability
 
 _PALETTE_REGISTRY = build_default_palette_registry()
 
-# Named regions of interest with their visual centers and zoom ranges.
+# detail_level → max iteration count (renderer will pick the minimum of this and
+# the zoom-scaled value set in build_recipe).
+_DETAIL_MAX_ITER: dict[DetailLevel, int] = {
+    DetailLevel.LOW: 100,
+    DetailLevel.MEDIUM: 256,
+    DetailLevel.HIGH: 512,
+}
+
 _REGIONS: list[dict[str, Any]] = [
     {
         "name": "main-cardioid",
@@ -84,6 +103,11 @@ _REGIONS: list[dict[str, Any]] = [
     },
 ]
 
+_RARE_EVENTS: dict[str, float] = {
+    "perfect-alignment": 1 / 200,
+    "golden-orbit": 1 / 500,
+}
+
 
 class MandelbrotDreamGenerator(SeededArrayGenerator):
     """Mandelbrot set with named regions, logarithmic zoom, and recipe pipeline."""
@@ -113,7 +137,7 @@ class MandelbrotDreamGenerator(SeededArrayGenerator):
 
         trait_probs: list[TraitProbability] = []
 
-        # --- Region of interest ---
+        # --- Region ---
         region_choices: list[WeightedChoice[dict[str, Any]]] = [
             WeightedChoice(value=r, weight=float(r["probability"])) for r in _REGIONS
         ]
@@ -125,17 +149,16 @@ class MandelbrotDreamGenerator(SeededArrayGenerator):
             probability=region_result.probability,
         ))
 
-        # --- Logarithmic zoom selection ---
+        # --- Zoom ---
         zoom_min = float(region["zoom_min"])
         zoom_max = float(region["zoom_max"])
         log_zoom = float(geom_rng.uniform(math.log(zoom_min), math.log(zoom_max)))
         zoom = math.exp(log_zoom)
 
-        # Iteration count scales with zoom depth; deeper zoom needs more iterations.
+        # --- Iterations (zoom-scaled; detail_level will cap this) ---
         base_iterations = 100
-        max_iterations = int(min(512, base_iterations + int(zoom * 3.5)))
+        zoom_scaled_iter = int(min(512, base_iterations + int(zoom * 3.5)))
 
-        # Center offset jitter (small random displacement from the region center).
         center_jitter = 0.05 / max(zoom * 0.1, 1.0)
         jitter_r = float(geom_rng.uniform(-center_jitter, center_jitter))
         jitter_i = float(geom_rng.uniform(-center_jitter, center_jitter))
@@ -157,39 +180,41 @@ class MandelbrotDreamGenerator(SeededArrayGenerator):
             probability=interior_result.probability,
         ))
 
-        # --- Color cycle direction ---
         color_cycle = float(geom_rng.uniform(0.0, 0.25))
 
         # --- Palette ---
-        palette = _PALETTE_REGISTRY.sample(palette_rng, compatible_generator=self.name)
-        palette_name = palette.name
-        if request.options.palette_name:
-            palette_name = request.options.palette_name
+        sampled_palette = _PALETTE_REGISTRY.sample(palette_rng, compatible_generator=self.name)
+        palette_name = request.options.palette_name or sampled_palette.name
 
         # --- Rare events ---
         rare_events: list[str] = []
-        if float(rarity_rng.random()) < 1 / 200:
-            rare_events.append("perfect-alignment")
-        if float(rarity_rng.random()) < 1 / 500:
-            rare_events.append("golden-orbit")
+        for event_name, prob in _RARE_EVENTS.items():
+            occurred = bool(rarity_rng.random() < prob)
+            if occurred:
+                rare_events.append(event_name)
+            trait_probs.append(TraitProbability(
+                trait_name=f"rare_event:{event_name}",
+                value="enabled" if occurred else "absent",
+                probability=prob if occurred else (1.0 - prob),
+            ))
 
+        # --- Derived recipe traits ---
         complexity_level = (
             ComplexityLevel.INTRICATE if zoom > 40.0 else
             ComplexityLevel.COMPLEX if zoom > 10.0 else
             ComplexityLevel.MODERATE
         )
+        detail_level = DetailLevel.HIGH if zoom_scaled_iter > 200 else DetailLevel.MEDIUM
 
-        detail_level = DetailLevel.HIGH if max_iterations > 200 else DetailLevel.MEDIUM
-
-        params: dict[str, Any] = {
-            "region": str(region["name"]),
-            "zoom": zoom,
-            "center_real": center_real,
-            "center_imag": center_imag,
-            "max_iterations": max_iterations,
-            "interior_mode": interior_mode,
-            "color_cycle": color_cycle,
-        }
+        params = MandelbrotDreamParams(
+            region=str(region["name"]),
+            zoom=zoom,
+            center_real=center_real,
+            center_imag=center_imag,
+            max_iterations=zoom_scaled_iter,  # renderer caps via detail_level
+            interior_mode=interior_mode,
+            color_cycle=color_cycle,
+        )
 
         recipe = ArtworkRecipe(
             schema_version=RECIPE_SCHEMA_VERSION,
@@ -207,7 +232,7 @@ class MandelbrotDreamGenerator(SeededArrayGenerator):
             lighting_mode=LightingMode.FLAT,
             accent_mode=AccentMode.NONE,
             rare_events=tuple(rare_events),
-            generator_params=params,
+            generator_params=params.to_dict(),
         )
         return recipe, trait_probs
 
@@ -215,21 +240,18 @@ class MandelbrotDreamGenerator(SeededArrayGenerator):
         """Render Mandelbrot fractal from a complete recipe. No RNG calls."""
         width = recipe.width
         height = recipe.height
+        p = MandelbrotDreamParams.from_dict(recipe.generator_params)
 
-        p = recipe.generator_params
-        zoom = float(p["zoom"])
-        center_real = float(p["center_real"])
-        center_imag = float(p["center_imag"])
-        max_iterations = int(p["max_iterations"])
-        interior_mode = str(p["interior_mode"])
-        color_cycle = float(p["color_cycle"])
+        # detail_level caps the iteration count, ensuring visual difference.
+        detail_cap = _DETAIL_MAX_ITER.get(recipe.detail_level, 256)
+        max_iterations = min(p.max_iterations, detail_cap)
 
         aspect_ratio = width / height
-        real_half = 1.6 / zoom * aspect_ratio
-        imag_half = 1.6 / zoom
+        real_half = 1.6 / p.zoom * aspect_ratio
+        imag_half = 1.6 / p.zoom
 
-        real_axis = np.linspace(center_real - real_half, center_real + real_half, width)
-        imag_axis = np.linspace(center_imag - imag_half, center_imag + imag_half, height)
+        real_axis = np.linspace(p.center_real - real_half, p.center_real + real_half, width)
+        imag_axis = np.linspace(p.center_imag - imag_half, p.center_imag + imag_half, height)
         complex_plane = real_axis[None, :] + 1j * imag_axis[:, None]
 
         state = np.zeros_like(complex_plane)
@@ -240,13 +262,10 @@ class MandelbrotDreamGenerator(SeededArrayGenerator):
             state[active] = state[active] * state[active] + complex_plane[active]
             escaped = (np.abs(state) > 2.0) & active
             if np.any(escaped):
-                # Smooth escape-time coloring using the bailout value.
                 abs_values = np.abs(state[escaped])
-                # Protect log against values exactly at 2.0.
                 log2_abs = np.log2(np.maximum(abs_values, 2.0 + 1e-10))
-                smooth_escape[escaped] = (
-                    iteration + 1 - np.log2(np.maximum(log2_abs, 1e-10))
-                )
+                log2_log2_abs = np.log2(np.maximum(log2_abs, 1e-10))
+                smooth_escape[escaped] = iteration + 1 - log2_log2_abs
                 active[escaped] = False
             if not np.any(active):
                 break
@@ -258,27 +277,71 @@ class MandelbrotDreamGenerator(SeededArrayGenerator):
             if max_val > 0:
                 normalized[escaped_mask] = smooth_escape[escaped_mask] / max_val
 
-        hue = color_cycle + 0.85 * normalized
-
-        # Interior color depends on interior_mode.
-        if interior_mode == "black":
-            sat_interior, val_interior = 0.0, 0.04
-        elif interior_mode == "white":
-            sat_interior, val_interior = 0.0, 0.95
-        elif interior_mode == "nebula":
-            sat_interior, val_interior = 0.55, 0.20
-        else:  # dark-star
-            sat_interior, val_interior = 0.30, 0.08
-
-        saturation = np.where(active, sat_interior, 0.90)
-        value = np.where(active, val_interior, 0.18 + 0.82 * normalized**0.65)
-
-        # Golden orbit rare event: show orbit-trap circles.
+        # Golden orbit rare event: highlight escape bands near 1/phi ≈ 0.618 in
+        # normalized escape time. Uses normalized (not raw state magnitude) so the
+        # condition is reachable for all fractal regions.
         if "golden-orbit" in recipe.rare_events:
             phi = (1.0 + math.sqrt(5.0)) / 2.0
-            orbit_dist = np.abs(np.abs(state) - phi)
-            orbit_ring = np.exp(-(orbit_dist**2) / 0.003)
-            value = np.clip(value + 0.4 * orbit_ring * escaped_mask, 0.0, 1.0)
-            hue = hue + 0.08 * orbit_ring * escaped_mask
+            normalized_time = smooth_escape / max(max_iterations, 1)
+            orbit_dist = np.abs(normalized_time - 1.0 / phi)
+            orbit_ring = np.exp(-(orbit_dist**2) / 0.004)
+            normalized = np.clip(normalized + 0.35 * orbit_ring * escaped_mask, 0.0, 1.0)
 
-        return hsv_to_rgb_bytes(hue, saturation, value)
+        # perfect-alignment: inject a symmetric ghosting pattern.
+        if "perfect-alignment" in recipe.rare_events:
+            sym_pattern = np.abs(np.sin(complex_plane.real * 8.0)) * 0.15
+            normalized = np.clip(normalized + sym_pattern * escaped_mask, 0.0, 1.0)
+
+        # Use the palette's cosine formula for escape-time coloring.
+        palette = _PALETTE_REGISTRY.get(recipe.palette_name)
+        palette_t = np.mod(p.color_cycle + 0.85 * normalized, 1.0)
+
+        import math as _math
+
+        import numpy as _np
+        a = _np.asarray(palette.cosine_a, dtype=_np.float64)
+        b = _np.asarray(palette.cosine_b, dtype=_np.float64)
+        c = _np.asarray(palette.cosine_c, dtype=_np.float64)
+        d = _np.asarray(palette.cosine_d, dtype=_np.float64)
+        t = palette_t[..., _np.newaxis]
+        rgb_float = a + b * _np.cos(_math.tau * (t * c + d))
+
+        # Interior pixels use the palette's background color.
+        if p.interior_mode == "black":
+            interior_rgb = _np.array([0.04, 0.04, 0.04], dtype=_np.float64)
+        elif p.interior_mode == "white":
+            interior_rgb = _np.array([0.95, 0.95, 0.95], dtype=_np.float64)
+        elif p.interior_mode == "nebula":
+            interior_rgb = _np.asarray(palette.shadow_color, dtype=_np.float64) * 1.2
+        else:  # dark-star
+            interior_rgb = _np.asarray(palette.background_color, dtype=_np.float64)
+
+        interior_mask = active[..., _np.newaxis]
+        rgb_float = _np.where(interior_mask, interior_rgb, rgb_float)
+
+        # Brightness ramp on escape field.
+        brightness = _np.where(active, 0.0, 0.18 + 0.82 * normalized**0.65)
+        rgb_float = rgb_float * _np.clip(brightness, 0.1, 1.0)[..., _np.newaxis]
+
+        # Radius for post-processing (distance from center of image).
+        h, w = height, width
+        yi = (_np.arange(h) - h / 2.0) / max(min(h, w) / 2.0, 0.5)
+        xi = (_np.arange(w) - w / 2.0) / max(min(h, w) / 2.0, 0.5)
+        xx, yy = _np.meshgrid(xi, yi)
+        radius = _np.hypot(xx, yy)
+
+        rgb_float = apply_recipe_post_processing(
+            rgb_float,
+            radius=radius,
+            x=xx,
+            y=yy,
+            lighting_mode=recipe.lighting_mode,
+            background_mode=recipe.background_mode,
+            accent_mode=recipe.accent_mode,
+            palette=palette,
+        )
+
+        return rgb_float_to_bytes(rgb_float)
+
+    def _get_recipe_params(self, recipe: ArtworkRecipe) -> dict[str, Any]:
+        return dict(recipe.generator_params)

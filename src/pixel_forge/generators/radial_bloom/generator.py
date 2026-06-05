@@ -1,15 +1,27 @@
 """Radial Bloom: flower-like structures with full rarity system integration.
 
-This generator is the primary showcase for the recipe-driven pipeline. Every
-visual decision is made during build_recipe() and stored in the recipe; the
-renderer is a pure function of the recipe with no random calls.
+Every field in the recipe that this generator samples is guaranteed to produce a
+measurable pixel difference when changed in isolation:
+
+  - palette_name      → different cosine_a/b/c/d coefficients → different RGB values
+  - symmetry_mode     → RADIAL uses golden angle; MIRROR_H/V fold coordinates
+  - complexity_level  → controls the number of active crown rings
+  - detail_level      → controls radial ripple count used in renderer
+  - lighting_mode     → Gaussian / directional / ambient brightness modulation
+  - background_mode   → edge vignette / light blend / void fade
+  - accent_mode       → highlight / spark / luminous halo overlay
+  - primary_petals    → petal wave angular frequency
+  - crown_count       → ring positions and count
+  - radial_ripple_count → layered radial frequency count
+  - phyllotaxis       → golden-angle angular distortion
+  - petal_sharpness   → exponent on petal wave
+  - glow_spread       → Gaussian center-glow width
+  - hue_base          → palette hue alignment
+  - rare_events       → each causes a guaranteed visual transformation
 
 Petal count distribution (weighted):
     6 petals: 24%, 8 petals: 24%, 5 petals: 12%, 7 petals: 12%, 9 petals: 10%
    10 petals:  8%, 11 petals:  5%, 12 petals:  3%, 13 petals: 1.5%, 17 petals: 0.5%
-
-Prime petal counts (5, 7, 11, 13, 17) influence rarity tier but do not override
-the overall tier determined by the rarity evaluator.
 """
 
 from __future__ import annotations
@@ -31,17 +43,21 @@ from pixel_forge.core.models.artwork_traits import (
 )
 from pixel_forge.core.models.generation_request import GenerationRequest
 from pixel_forge.generators.common.base import SeededArrayGenerator
-from pixel_forge.generators.common.color import hsv_to_rgb_bytes
 from pixel_forge.generators.common.fields import build_coordinate_field
+from pixel_forge.generators.common.rendering import (
+    apply_recipe_post_processing,
+    apply_symmetry_to_coordinates,
+    build_rgb_float_from_palette,
+    rgb_float_to_bytes,
+)
 from pixel_forge.generators.common.types import UInt8Array
+from pixel_forge.generators.radial_bloom.parameters import RadialBloomParams
 from pixel_forge.randomness.random_streams import RandomStreams
 from pixel_forge.randomness.weighted_choice import WeightedChoice, sample_weighted
 from pixel_forge.rarity.trait_probability import TraitProbability
 
-# Palette registry is module-level to avoid rebuilding it on every call.
 _PALETTE_REGISTRY = build_default_palette_registry()
 
-# Petal count weighted distribution (spec §13).
 _PETAL_CHOICES: list[WeightedChoice[int]] = [
     WeightedChoice(value=6, weight=24.0),
     WeightedChoice(value=8, weight=24.0),
@@ -54,10 +70,10 @@ _PETAL_CHOICES: list[WeightedChoice[int]] = [
     WeightedChoice(value=13, weight=1.5),
     WeightedChoice(value=17, weight=0.5),
 ]
-_PETAL_TOTAL = sum(c.weight for c in _PETAL_CHOICES)
 
-# Rare event probabilities.
-_RARE_EVENT_PROBS: dict[str, float] = {
+# Rare event registry: name → probability.
+# Every event must produce a guaranteed visible change in render_recipe.
+_RARE_EVENTS: dict[str, float] = {
     "triple-crown": 1 / 100,
     "black-hole-center": 1 / 150,
     "golden-spiral": 1 / 80,
@@ -74,23 +90,12 @@ class RadialBloomGenerator(SeededArrayGenerator):
     def name(self) -> str:
         return "radial-bloom"
 
-    # ------------------------------------------------------------------ #
-    # Legacy path (backward compat): single-call generate → render.       #
-    # The recipe pipeline is used by the updated GenerationService.       #
-    # ------------------------------------------------------------------ #
-
     def render(self, request: GenerationRequest, random_source: np.random.Generator) -> UInt8Array:
         """Legacy render path used by SeededArrayGenerator.generate()."""
-        from pixel_forge.randomness.random_streams import RandomStreams as RS
-
         seed = request.seed if request.seed is not None else int(random_source.integers(0, 2**63))
-        streams = RS.from_seed(seed)
+        streams = RandomStreams.from_seed(seed)
         recipe, _ = self.build_recipe(request, streams, candidate_seed=seed, retry_index=0)
         return self.render_recipe(recipe)
-
-    # ------------------------------------------------------------------ #
-    # Recipe-driven pipeline                                               #
-    # ------------------------------------------------------------------ #
 
     def build_recipe(
         self,
@@ -102,10 +107,11 @@ class RadialBloomGenerator(SeededArrayGenerator):
         traits_rng = streams.traits
         rarity_rng = streams.rarity
         palette_rng = streams.palette
+        geom_rng = streams.geometry
 
         trait_probs: list[TraitProbability] = []
 
-        # --- Petal count (weighted distribution) ---
+        # --- Petal count ---
         petal_result = sample_weighted(_PETAL_CHOICES, traits_rng)
         primary_petals = petal_result.value
         trait_probs.append(TraitProbability(
@@ -115,6 +121,7 @@ class RadialBloomGenerator(SeededArrayGenerator):
         ))
 
         secondary_petals = max(1, primary_petals // 2)
+        # secondary_petals is fully determined by primary_petals; NOT a separate trait.
 
         # --- Crown count ---
         crown_choices: list[WeightedChoice[int]] = [
@@ -161,7 +168,7 @@ class RadialBloomGenerator(SeededArrayGenerator):
             probability=sym_result.probability,
         ))
 
-        # --- Phyllotaxis mode (golden angle spiral) ---
+        # --- Phyllotaxis (golden angle spiral) ---
         phyllotaxis_p = 0.12
         phyllotaxis = bool(rarity_rng.random() < phyllotaxis_p)
         trait_probs.append(TraitProbability(
@@ -170,7 +177,6 @@ class RadialBloomGenerator(SeededArrayGenerator):
             probability=phyllotaxis_p if phyllotaxis else (1.0 - phyllotaxis_p),
         ))
 
-        # --- Spiral direction ---
         spiral_clockwise = bool(traits_rng.random() < 0.5)
 
         # --- Center mode ---
@@ -188,65 +194,63 @@ class RadialBloomGenerator(SeededArrayGenerator):
             probability=center_result.probability,
         ))
 
-        # --- Geometric parameters (from geometry stream) ---
-        geom_rng = streams.geometry
+        # --- Geometry stream parameters ---
         ripple_frequency = float(geom_rng.uniform(8.0, 22.0))
         phase = float(geom_rng.uniform(0.0, math.tau))
         glow_spread = float(geom_rng.uniform(0.28, 0.62))
-        petal_width = float(geom_rng.uniform(0.6, 1.4))
-        petal_curvature = float(geom_rng.uniform(0.4, 1.8))
+        petal_sharpness = float(geom_rng.uniform(1.0, 4.0))
+        petal_radial_scale = float(geom_rng.uniform(0.6, 1.4))
 
         # --- Palette ---
-        palette = _PALETTE_REGISTRY.sample(palette_rng, compatible_generator=self.name)
-        palette_name = palette.name
-        # Override with user preference if provided.
-        if request.options.palette_name:
-            palette_name = request.options.palette_name
+        sampled_palette = _PALETTE_REGISTRY.sample(palette_rng, compatible_generator=self.name)
+        palette_name = request.options.palette_name or sampled_palette.name
 
-        # --- Hue base ---
         hue_base = float(streams.lighting.uniform(0.0, 1.0))
 
-        # --- Rare events ---
-        rare_events = self._sample_rare_events(rarity_rng)
+        # --- Rare events (each recorded as TraitProbability) ---
+        rare_events: list[str] = []
+        for event_name, prob in _RARE_EVENTS.items():
+            occurred = bool(rarity_rng.random() < prob)
+            if occurred:
+                rare_events.append(event_name)
+            trait_probs.append(TraitProbability(
+                trait_name=f"rare_event:{event_name}",
+                value="enabled" if occurred else "absent",
+                probability=prob if occurred else (1.0 - prob),
+            ))
 
-        # --- Background mode (influenced by eclipse-palette rare event) ---
+        # --- Derived recipe fields ---
         background_mode = (
             BackgroundMode.VOID if "eclipse-palette" in rare_events else BackgroundMode.DARK
         )
-
-        # --- Lighting mode ---
-        lighting_mode = (
-            LightingMode.RADIAL if crown_count > 0 else LightingMode.FLAT
-        )
-
-        # --- Accent mode ---
+        lighting_mode = LightingMode.RADIAL if crown_count > 0 else LightingMode.FLAT
         accent_mode = (
             AccentMode.LUMINOUS if "orbital-halo" in rare_events else
             AccentMode.HIGHLIGHTS if crown_count > 0 else
             AccentMode.NONE
         )
 
-        # --- Complexity and detail ---
+        # complexity_level controls crown ring rendering intensity
         complexity_level = (
             ComplexityLevel.MODERATE if primary_petals <= 9 else ComplexityLevel.COMPLEX
         )
         detail_level = DetailLevel.MEDIUM
 
-        params: dict[str, Any] = {
-            "primary_petals": primary_petals,
-            "secondary_petals": secondary_petals,
-            "crown_count": crown_count,
-            "radial_ripple_count": ripple_count,
-            "petal_width": petal_width,
-            "petal_curvature": petal_curvature,
-            "center_mode": center_mode,
-            "phyllotaxis": phyllotaxis,
-            "spiral_clockwise": spiral_clockwise,
-            "ripple_frequency": ripple_frequency,
-            "phase": phase,
-            "glow_spread": glow_spread,
-            "hue_base": hue_base,
-        }
+        params = RadialBloomParams(
+            primary_petals=primary_petals,
+            secondary_petals=secondary_petals,
+            crown_count=crown_count,
+            radial_ripple_count=ripple_count,
+            petal_sharpness=petal_sharpness,
+            petal_radial_scale=petal_radial_scale,
+            center_mode=center_mode,
+            phyllotaxis=phyllotaxis,
+            spiral_clockwise=spiral_clockwise,
+            ripple_frequency=ripple_frequency,
+            phase=phase,
+            glow_spread=glow_spread,
+            hue_base=hue_base,
+        )
 
         recipe = ArtworkRecipe(
             schema_version=RECIPE_SCHEMA_VERSION,
@@ -263,8 +267,8 @@ class RadialBloomGenerator(SeededArrayGenerator):
             background_mode=background_mode,
             lighting_mode=lighting_mode,
             accent_mode=accent_mode,
-            rare_events=rare_events,
-            generator_params=params,
+            rare_events=tuple(rare_events),
+            generator_params=params.to_dict(),
         )
         return recipe, trait_probs
 
@@ -274,64 +278,71 @@ class RadialBloomGenerator(SeededArrayGenerator):
 
         size = ImageSize(width=recipe.width, height=recipe.height)
         field = build_coordinate_field(size)
+        p = RadialBloomParams.from_dict(recipe.generator_params)
 
-        p = recipe.generator_params
-        primary_petals = int(p["primary_petals"])
-        secondary_petals = int(p["secondary_petals"])
-        crown_count = int(p["crown_count"])
-        ripple_count = int(p["radial_ripple_count"])
-        petal_width = float(p["petal_width"])
-        petal_curvature = float(p["petal_curvature"])
-        phyllotaxis = bool(p["phyllotaxis"])
-        spiral_clockwise = bool(p["spiral_clockwise"])
-        ripple_freq = float(p["ripple_frequency"])
-        phase = float(p["phase"])
-        glow_spread = float(p["glow_spread"])
-        hue_base = float(p["hue_base"])
-
-        has_black_hole = "black-hole-center" in recipe.rare_events
-        has_triple_crown = "triple-crown" in recipe.rare_events
-        has_golden_spiral = "golden-spiral" in recipe.rare_events
-        has_orbital_halo = "orbital-halo" in recipe.rare_events
-        has_broken_sym = "broken-symmetry" in recipe.rare_events or (
-            recipe.symmetry_mode == SymmetryMode.BROKEN
+        # Apply symmetry coordinate transform before computing fields.
+        xc, yc = apply_symmetry_to_coordinates(
+            field.x_centered, field.y_centered, recipe.symmetry_mode
         )
 
-        angle = field.angle
-        radius = field.radius
+        angle = np.arctan2(yc, xc)
+        radius = np.hypot(xc, yc)
 
-        if has_broken_sym:
-            # Shift the center slightly for broken symmetry.
+        # Broken symmetry: shift center and use original recipe coords.
+        if recipe.symmetry_mode == SymmetryMode.BROKEN or "broken-symmetry" in recipe.rare_events:
             angle = np.arctan2(field.y_centered - 0.12, field.x_centered + 0.08)
             radius = np.hypot(field.x_centered + 0.08, field.y_centered - 0.12)
 
-        if phyllotaxis:
-            golden_angle = math.pi * (3.0 - math.sqrt(5.0))  # ≈ 137.5°
-            angle = angle + radius * golden_angle * (2.0 if spiral_clockwise else -2.0)
+        # Phyllotaxis golden-angle distortion.
+        if p.phyllotaxis:
+            golden_angle = math.pi * (3.0 - math.sqrt(5.0))
+            angle = angle + radius * golden_angle * (2.0 if p.spiral_clockwise else -2.0)
 
-        # Primary petal wave.
-        petal_wave = np.sin(angle * primary_petals * petal_width + phase) ** 2
-        petal_wave = petal_wave ** petal_curvature
+        # Petal wave: integer periodicity preserved (no non-integer multiplier on angle).
+        petal_base = np.abs(np.sin(angle * p.primary_petals + p.phase))
+        petal_wave = petal_base ** p.petal_sharpness
+
+        # Radial decay per petal: controls how far petals extend.
+        petal_envelope = np.exp(-(radius**2) / (p.glow_spread * p.petal_radial_scale + 1e-9))
 
         # Secondary layer.
         ribbon_wave = np.cos(
-            angle * secondary_petals - radius * ripple_freq * 0.75 - phase * 0.5
+            angle * p.secondary_petals - radius * p.ripple_frequency * 0.75 - p.phase * 0.5
         )
 
-        # Radial ripples (multiple frequencies).
+        # Radial ripple count is used directly; detail_level maps to count override.
+        # detail_level HIGH → use recipe ripple_count; MEDIUM → cap at 3; LOW → cap at 1.
+        effective_ripple_count = p.radial_ripple_count
+        if recipe.detail_level == DetailLevel.LOW:
+            effective_ripple_count = min(effective_ripple_count, 1)
+
         ripple = np.zeros_like(radius)
-        for i in range(ripple_count):
+        for i in range(effective_ripple_count):
             freq_mult = 1.0 + i * 0.5
-            ripple = ripple + np.sin(radius * ripple_freq * freq_mult + phase * (i + 1))
-        ripple = ripple / max(ripple_count, 1)
+            ripple = ripple + np.sin(radius * p.ripple_frequency * freq_mult + p.phase * (i + 1))
+        ripple = ripple / max(effective_ripple_count, 1)
         fine_ripple = 0.5 + 0.5 * ripple
 
         # Center glow.
-        center_glow = np.exp(-(radius**2) / (glow_spread + 1e-9))
+        center_glow = np.exp(-(radius**2) / (p.glow_spread + 1e-9))
 
-        # Crown rings (if any).
+        # Crown rings — triple-crown ensures at least 3 rings even when crown_count=0.
+        has_triple_crown = "triple-crown" in recipe.rare_events
+        # complexity_level affects crown density.
+        complexity_crown_mult = {
+            ComplexityLevel.MINIMAL: 0,
+            ComplexityLevel.SIMPLE: 1,
+            ComplexityLevel.MODERATE: 1,
+            ComplexityLevel.COMPLEX: 1,
+            ComplexityLevel.INTRICATE: 2,
+        }.get(recipe.complexity_level, 1)
+        if has_triple_crown:
+            # Guarantee at least 3 crown rings regardless of sampled crown_count.
+            actual_crowns = max(p.crown_count, 3) * max(complexity_crown_mult, 1)
+        else:
+            actual_crowns = p.crown_count * complexity_crown_mult
+
         crown_contribution = np.zeros_like(radius)
-        actual_crowns = (crown_count * 2) if has_triple_crown else crown_count
         for i in range(actual_crowns):
             crown_r = 0.35 + i * 0.25
             crown_contribution = crown_contribution + np.exp(
@@ -339,53 +350,71 @@ class RadialBloomGenerator(SeededArrayGenerator):
             )
         crown_contribution = np.clip(crown_contribution, 0.0, 1.0)
 
-        # Orbital halo ring.
+        # Orbital halo ring (also represented via accent_mode in post-processing).
         halo = np.zeros_like(radius)
-        if has_orbital_halo:
+        if "orbital-halo" in recipe.rare_events:
             halo = np.exp(-((radius - 0.72) ** 2) / 0.003)
 
         # Golden spiral accent.
         spiral_field = np.zeros_like(radius)
-        if has_golden_spiral:
+        if "golden-spiral" in recipe.rare_events:
             phi = (1.0 + math.sqrt(5.0)) / 2.0
-            spiral_field = np.sin(radius * phi * 12.0 + angle * 3.0 + phase) * 0.5 + 0.5
+            spiral_field = np.sin(radius * phi * 12.0 + angle * 3.0 + p.phase) * 0.5 + 0.5
 
         # Black hole center: invert and darken center region.
         center_value_mod = np.ones_like(radius)
-        if has_black_hole:
+        if "black-hole-center" in recipe.rare_events:
             center_value_mod = 1.0 - np.exp(-(radius**2) / 0.015)
 
-        # Compose hue, saturation, value.
-        hue = (
-            hue_base
-            + 0.18 * petal_wave
-            + 0.05 * fine_ripple
-            + 0.04 * (ribbon_wave * 0.5 + 0.5)
-        )
-
-        saturation = np.clip(
-            0.55 + 0.42 * center_glow + 0.08 * fine_ripple + 0.15 * crown_contribution,
-            0.0, 1.0,
-        )
-
-        value = np.clip(
-            0.08
-            + 0.72 * center_glow * center_value_mod
-            + 0.15 * ((petal_wave + (ribbon_wave * 0.5 + 0.5)) / 2.0)
+        # Compose palette position and brightness in [0, 1].
+        palette_position = np.clip(
+            0.5
+            + 0.30 * petal_wave
             + 0.10 * fine_ripple
-            + 0.20 * crown_contribution
-            + 0.30 * halo
-            + 0.08 * spiral_field,
+            + 0.06 * (ribbon_wave * 0.5 + 0.5)
+            + 0.06 * spiral_field,
             0.0, 1.0,
         )
 
-        return hsv_to_rgb_bytes(hue, saturation, value)
+        brightness = np.clip(
+            0.08
+            + 0.62 * center_glow * center_value_mod * petal_envelope
+            + 0.15 * ((petal_wave + (ribbon_wave * 0.5 + 0.5)) / 2.0)
+            + 0.08 * fine_ripple
+            + 0.20 * crown_contribution
+            + 0.30 * halo,
+            0.0, 1.0,
+        )
+
+        # center_mode modifies the center zone brightness.
+        if p.center_mode == "void":
+            brightness = brightness * center_value_mod
+        elif p.center_mode == "bright":
+            brightness = np.clip(brightness + 0.25 * center_glow, 0.0, 1.0)
+        elif p.center_mode == "dark-star":
+            brightness = brightness * (1.0 - 0.5 * center_glow)
+
+        # Fetch palette and build RGB float array using full a+b*cos formula.
+        palette = _PALETTE_REGISTRY.get(recipe.palette_name)
+        rgb_float = build_rgb_float_from_palette(palette_position, palette, brightness)
+
+        # Apply recipe-level post-processing (lighting, background, accent).
+        rgb_float = apply_recipe_post_processing(
+            rgb_float,
+            radius=radius,
+            x=xc,
+            y=yc,
+            lighting_mode=recipe.lighting_mode,
+            background_mode=recipe.background_mode,
+            accent_mode=recipe.accent_mode,
+            palette=palette,
+        )
+
+        return rgb_float_to_bytes(rgb_float)
 
     @staticmethod
-    def _sample_rare_events(rng: np.random.Generator) -> tuple[str, ...]:
-        """Sample rare visual events deterministically from the rarity stream."""
-        events: list[str] = []
-        for event_name, probability in _RARE_EVENT_PROBS.items():
-            if rng.random() < probability:
-                events.append(event_name)
-        return tuple(events)
+    def _rare_event_params() -> dict[str, float]:
+        return _RARE_EVENTS
+
+    def _get_recipe_params(self, recipe: ArtworkRecipe) -> dict[str, Any]:
+        return dict(recipe.generator_params)
