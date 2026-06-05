@@ -23,7 +23,7 @@ def test_service_generates_a_valid_png(tmp_path: Path) -> None:
     result = service.generate(
         GenerationRequest(
             size=ImageSize(width=16, height=12),
-            generator_name="random-noise",
+            generator_name="harmonic-waves",
             output_path=output_path,
             seed=42,
         )

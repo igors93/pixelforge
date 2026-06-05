@@ -11,7 +11,7 @@ from pixel_forge.shared.validation import RequestValidator
 def make_request(width: int, height: int, seed: int | None = None) -> GenerationRequest:
     return GenerationRequest(
         size=ImageSize(width=width, height=height),
-        generator_name="random-noise",
+        generator_name="harmonic-waves",
         output_path=Path("output/test.png"),
         seed=seed,
     )

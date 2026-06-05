@@ -16,9 +16,9 @@ class Settings:
     min_height: int = 1
     max_width: int = 1000
     max_height: int = 1000
-    default_width: int = 256
-    default_height: int = 256
-    default_generator: str = "random-noise"
-    default_output_path: Path = Path("output/random-noise.png")
+    default_width: int = 512
+    default_height: int = 512
+    default_generator: str = "harmonic-waves"
+    default_output_path: Path = Path("output/harmonic-waves.png")
     supported_output_suffixes: tuple[str, ...] = (".png",)
     png_compress_level: int = 6
