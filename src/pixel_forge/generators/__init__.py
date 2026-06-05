@@ -1,5 +1,6 @@
 """Procedural image generator implementations."""
 
+from pixel_forge.generators.geometric_orbit import GeometricOrbitGenerator
 from pixel_forge.generators.harmonic_waves import HarmonicWavesGenerator
 from pixel_forge.generators.mandelbrot_dream import MandelbrotDreamGenerator
 from pixel_forge.generators.plasma_flow import PlasmaFlowGenerator
@@ -9,6 +10,7 @@ from pixel_forge.generators.registry import GeneratorRegistry, build_default_reg
 
 __all__ = [
     "GeneratorRegistry",
+    "GeometricOrbitGenerator",
     "HarmonicWavesGenerator",
     "MandelbrotDreamGenerator",
     "PlasmaFlowGenerator",

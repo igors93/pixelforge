@@ -40,11 +40,11 @@ class GeneratorRegistry:
         return name.strip().lower()
 
 
+
 def build_default_registry() -> GeneratorRegistry:
     """Build the production registry in one explicit composition location."""
 
-    # Local imports keep the composition root explicit and help avoid circular
-    # dependencies between the registry and generator packages.
+    from pixel_forge.generators.geometric_orbit import GeometricOrbitGenerator
     from pixel_forge.generators.harmonic_waves import HarmonicWavesGenerator
     from pixel_forge.generators.mandelbrot_dream import MandelbrotDreamGenerator
     from pixel_forge.generators.plasma_flow import PlasmaFlowGenerator
@@ -58,5 +58,6 @@ def build_default_registry() -> GeneratorRegistry:
             RadialBloomGenerator(),
             MandelbrotDreamGenerator(),
             RandomNoiseGenerator(),
+            GeometricOrbitGenerator(),
         ]
     )
