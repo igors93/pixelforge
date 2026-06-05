@@ -27,3 +27,15 @@ class OutputFileExistsError(PixelForgeError):
 
 class OutputWriteError(PixelForgeError):
     """Raised when encoded image bytes cannot be written to storage."""
+
+
+class PaletteNotFoundError(PixelForgeError):
+    """Raised when a requested palette name is not in the registry."""
+
+
+class QualityRejectionError(PixelForgeError):
+    """Raised in strict-quality mode when all retry candidates are rejected."""
+
+
+class IncompatibleTraitsError(PixelForgeError):
+    """Raised when user-supplied trait overrides are mutually incompatible."""

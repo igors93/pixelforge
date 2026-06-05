@@ -3,7 +3,9 @@
 import sys
 from collections.abc import Sequence
 
+from pixel_forge.cli.commands.explore import run_explore_command
 from pixel_forge.cli.commands.generate import run_generate_command
+from pixel_forge.cli.commands.inspect_seed import run_inspect_seed_command
 from pixel_forge.cli.commands.list_generators import run_list_generators_command
 from pixel_forge.cli.parser import build_parser
 from pixel_forge.core.config import Settings
@@ -36,6 +38,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if arguments.command == "list-generators":
             return run_list_generators_command(registry)
+
+        if arguments.command == "inspect-seed":
+            return run_inspect_seed_command(arguments, registry)
+
+        if arguments.command == "explore":
+            return run_explore_command(arguments, registry, settings)
 
         parser.error(f"Unsupported command: {arguments.command}")
     except PixelForgeError as error:

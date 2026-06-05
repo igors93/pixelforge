@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+from pixel_forge.core.models.generation_options import GenerationOptions
 from pixel_forge.core.models.image_size import ImageSize
 
 
@@ -15,3 +16,4 @@ class GenerationRequest:
     output_path: Path
     seed: int | None = None
     overwrite: bool = False
+    options: GenerationOptions = GenerationOptions()

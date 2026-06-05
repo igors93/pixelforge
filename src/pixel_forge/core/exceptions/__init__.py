@@ -3,9 +3,12 @@
 from pixel_forge.core.exceptions.errors import (
     DuplicateGeneratorError,
     GeneratorNotFoundError,
+    IncompatibleTraitsError,
     OutputFileExistsError,
     OutputWriteError,
+    PaletteNotFoundError,
     PixelForgeError,
+    QualityRejectionError,
     UnsupportedOutputFormatError,
     ValidationError,
 )
@@ -13,9 +16,12 @@ from pixel_forge.core.exceptions.errors import (
 __all__ = [
     "DuplicateGeneratorError",
     "GeneratorNotFoundError",
+    "IncompatibleTraitsError",
     "OutputFileExistsError",
     "OutputWriteError",
+    "PaletteNotFoundError",
     "PixelForgeError",
+    "QualityRejectionError",
     "UnsupportedOutputFormatError",
     "ValidationError",
 ]

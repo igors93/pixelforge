@@ -18,6 +18,11 @@ class SeededArrayGenerator(ABC):
     Subclasses implement only their mathematical rendering logic. This class
     centralizes seed handling, validates the returned array, and converts it to
     the immutable ``GeneratedImage`` domain model.
+
+    Generators that also implement ``RecipeGenerator`` (from recipe_generator.py)
+    participate in the full recipe-driven pipeline coordinated by the service.
+    Legacy generators that only extend this class use the simpler single-call
+    path for backward compatibility.
     """
 
     @property

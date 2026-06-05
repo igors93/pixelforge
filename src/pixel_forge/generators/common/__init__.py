@@ -6,11 +6,13 @@ from pixel_forge.generators.common.color import (
     hsv_to_rgb_bytes,
 )
 from pixel_forge.generators.common.fields import CoordinateField, build_coordinate_field
+from pixel_forge.generators.common.recipe_generator import RecipeGenerator
 from pixel_forge.generators.common.types import FloatArray, UInt8Array
 
 __all__ = [
     "CoordinateField",
     "FloatArray",
+    "RecipeGenerator",
     "SeededArrayGenerator",
     "UInt8Array",
     "build_coordinate_field",
