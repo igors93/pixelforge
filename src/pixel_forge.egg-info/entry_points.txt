@@ -1,0 +1,2 @@
+[console_scripts]
+pixelforge = pixel_forge.cli.main:main
