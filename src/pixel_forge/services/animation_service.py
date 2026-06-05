@@ -1,30 +1,25 @@
 """Application service that coordinates procedural GIF animation generation.
 
 Pipeline:
-  1.  Validate the animation request and options.
-  2.  Resolve the static generator (must be a RecipeGenerator).
-  3.  Resolve the animated renderer (must be an AnimatedRecipeRenderer).
-  4.  Build the static artwork recipe (same pipeline as GenerationService).
-  5.  Apply static compatibility rules to the recipe.
-  6.  Derive a deterministic animation seed from the static candidate seed.
-  7.  Build the animation recipe (all motion decisions, no pixels yet).
-  8.  Render representative frames for palette construction and quality probing.
-  9.  Build a deterministic global GIF palette from representative frames.
- 10.  Render all N frames and collect them.
- 11.  Evaluate temporal quality.
- 12.  Retry deterministically if temporal quality is below threshold.
- 13.  Encode the GIF from palette-indexed frames.
- 14.  Write GIF and JSON manifest atomically.
- 15.  Return AnimationResult.
+  1. Validate the animation request and options.
+  2. Resolve the static recipe generator.
+  3. Resolve the generator-specific animated renderer.
+  4. Build and validate the static artwork recipe.
+  5. Build deterministic animation candidates.
+  6. Render frames and evaluate temporal quality and rarity.
+  7. Encode the accepted or best candidate as GIF.
+  8. Persist the GIF and optional JSON manifest.
 
-Static PNG output is NOT modified by this service.
+Static PNG output is not modified by this service.
 """
 
 from __future__ import annotations
 
+import os
 import secrets
 import tempfile
-import os
+from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -32,31 +27,38 @@ import numpy as np
 from pixel_forge.aesthetics.compatibility.recipe_compatibility_validator import (
     RecipeCompatibilityValidator,
 )
-from pixel_forge.aesthetics.palettes.palette_registry import build_default_palette_registry
 from pixel_forge.animation.animation_randomness import (
     AnimationStreams,
     derive_animation_retry_seed,
     derive_animation_seed,
 )
-from pixel_forge.animation.frame_phase import generate_frame_phases, representative_phases
-from pixel_forge.animation.motion_profiles import (
-    ALL_PROFILES_BY_GENERATOR,
-    DEFAULT_PROFILE_BY_GENERATOR,
-)
+from pixel_forge.animation.frame_phase import generate_frame_phases
+from pixel_forge.animation.motion_profiles import ALL_PROFILES_BY_GENERATOR
 from pixel_forge.animation.protocols import AnimatedRecipeRenderer
-from pixel_forge.animation.quality import TemporalQualityEvaluator, TemporalQualityThresholds
+from pixel_forge.animation.quality import (
+    TemporalQualityEvaluator,
+    TemporalQualityThresholds,
+)
+from pixel_forge.core.config import Settings
 from pixel_forge.core.exceptions import (
-    GeneratorNotFoundError,
     OptionsValidationError,
+    OutputFileExistsError,
     QualityRejectionError,
     UnsupportedOutputFormatError,
     ValidationError,
 )
-from pixel_forge.core.models.animation_options import AnimationOptions
-from pixel_forge.core.models.animation_recipe import AnimationRecipe
+from pixel_forge.core.models.animation_recipe import (
+    ANIMATION_SCHEMA_VERSION,
+    AnimationRecipe,
+)
 from pixel_forge.core.models.animation_request import AnimationRequest
 from pixel_forge.core.models.animation_result import AnimationResult
+from pixel_forge.core.models.artwork_recipe import RECIPE_SCHEMA_VERSION
+from pixel_forge.core.models.generation_options import GenerationOptions
+from pixel_forge.core.models.generation_request import GenerationRequest
 from pixel_forge.core.models.image_size import ImageSize
+from pixel_forge.core.models.rarity_result import RarityResult
+from pixel_forge.core.models.temporal_quality_result import TemporalQualityResult
 from pixel_forge.generators.common.recipe_generator import RecipeGenerator
 from pixel_forge.generators.common.types import UInt8Array
 from pixel_forge.generators.registry import GeneratorRegistry
@@ -71,54 +73,63 @@ from pixel_forge.metadata.animation_manifest_writer import AnimationManifestWrit
 from pixel_forge.randomness.deterministic_retry import derive_candidate_seed
 from pixel_forge.randomness.random_streams import RandomStreams
 from pixel_forge.rarity.rarity_evaluator import RarityEvaluator
+from pixel_forge.rarity.trait_probability import TraitProbability
 
-_PALETTE_REGISTRY = build_default_palette_registry()
-
-# Maps generator name → animated renderer class.
-_ANIMATED_RENDERERS: dict[str, type[AnimatedRecipeRenderer]] = {}
-
-
-def _build_renderer_registry() -> dict[str, AnimatedRecipeRenderer]:
-    """Import and instantiate all animated renderers."""
-    from pixel_forge.generators.harmonic_waves.animation import HarmonicWavesAnimator
-    from pixel_forge.generators.radial_bloom.animation import RadialBloomAnimator
-    from pixel_forge.generators.plasma_flow.animation import PlasmaFlowAnimator
-    from pixel_forge.generators.mandelbrot_dream.animation import MandelbrotDreamAnimator
-
-    renderers: list[AnimatedRecipeRenderer] = [
-        HarmonicWavesAnimator(),
-        RadialBloomAnimator(),
-        PlasmaFlowAnimator(),
-        MandelbrotDreamAnimator(),
-    ]
-    return {r.name: r for r in renderers}
-
-
-_RENDERER_REGISTRY: dict[str, AnimatedRecipeRenderer] = _build_renderer_registry()
-
-# Safety limits
+# Animation-specific safety limits.
 _MIN_FRAMES = 2
 _MAX_FRAMES = 120
 _MIN_FPS = 1
 _MAX_FPS = 60
-_MAX_PIXEL_BUDGET = 512 * 512 * 120  # width × height × frame_count
+_MAX_ANIMATION_RETRIES = 20
+_MAX_PIXEL_BUDGET = 512 * 512 * 120
+
+_RARITY_RANK: dict[str, int] = {
+    "Common": 0,
+    "Uncommon": 1,
+    "Rare": 2,
+    "Epic": 3,
+    "Legendary": 4,
+}
+
+
+def _build_renderer_registry() -> dict[str, AnimatedRecipeRenderer]:
+    """Import and instantiate every available animated renderer."""
+    from pixel_forge.generators.harmonic_waves.animation import HarmonicWavesAnimator
+    from pixel_forge.generators.mandelbrot_dream.animation import MandelbrotDreamAnimator
+    from pixel_forge.generators.plasma_flow.animation import PlasmaFlowAnimator
+    from pixel_forge.generators.radial_bloom.animation import RadialBloomAnimator
+
+    renderers: tuple[AnimatedRecipeRenderer, ...] = (
+        HarmonicWavesAnimator(),
+        RadialBloomAnimator(),
+        PlasmaFlowAnimator(),
+        MandelbrotDreamAnimator(),
+    )
+    return {renderer.name: renderer for renderer in renderers}
+
+
+_RENDERER_REGISTRY = _build_renderer_registry()
 
 
 class AnimationService:
-    """Execute one complete, validated animation generation operation."""
+    """Execute one complete and validated animation generation operation."""
 
     def __init__(
         self,
         *,
         registry: GeneratorRegistry,
+        settings: Settings | None = None,
         writer: AtomicFileWriter | None = None,
         temporal_quality_thresholds: TemporalQualityThresholds | None = None,
     ) -> None:
         self._registry = registry
+        self._settings = settings or Settings()
         self._writer = writer or AtomicFileWriter()
         self._compat_validator = RecipeCompatibilityValidator()
         self._rarity_evaluator = RarityEvaluator()
-        self._temporal_evaluator = TemporalQualityEvaluator(temporal_quality_thresholds)
+        self._temporal_evaluator = TemporalQualityEvaluator(
+            temporal_quality_thresholds
+        )
         self._manifest_writer = AnimationManifestWriter()
 
     def animate(self, request: AnimationRequest) -> AnimationResult:
@@ -130,36 +141,61 @@ class AnimationService:
             raise UnsupportedOutputFormatError(
                 f"Animation output must be a .gif file, got: {output_path.suffix}"
             )
+
+        metadata_output_path = output_path.with_suffix(".json")
         if output_path.exists() and not request.overwrite:
-            from pixel_forge.core.exceptions import OutputFileExistsError
             raise OutputFileExistsError(
-                f"Output file already exists: {output_path}. Use --overwrite to replace."
+                f"Output file already exists: {output_path}. "
+                "Use --overwrite to replace it."
+            )
+        if (
+            request.options.write_metadata
+            and metadata_output_path.exists()
+            and not request.overwrite
+        ):
+            raise OutputFileExistsError(
+                f"Metadata file already exists: {metadata_output_path}. "
+                "Use --overwrite to replace it."
             )
 
         opts = request.options
+
+        # Use the service default unless the user explicitly overrides the
+        # aggregate temporal-quality threshold for this request.
+        evaluator = self._temporal_evaluator
+        if opts.temporal_quality_threshold is not None:
+            evaluator = TemporalQualityEvaluator(
+                TemporalQualityThresholds(
+                    min_aggregate_score=opts.temporal_quality_threshold,
+                )
+            )
+
         generator = self._registry.get(request.generator_name)
         if not isinstance(generator, RecipeGenerator):
             raise ValidationError(
                 f"Generator '{request.generator_name}' does not support animation "
-                "(it is not a recipe-driven generator)."
+                "because it is not recipe-driven."
             )
 
         renderer = _RENDERER_REGISTRY.get(request.generator_name)
         if renderer is None:
+            supported = ", ".join(sorted(_RENDERER_REGISTRY))
             raise ValidationError(
                 f"Generator '{request.generator_name}' does not have an animated "
-                "renderer. Supported: " + ", ".join(sorted(_RENDERER_REGISTRY))
+                f"renderer. Supported animated generators: {supported}"
             )
 
-        master_seed = request.seed if request.seed is not None else secrets.randbits(64)
-        schema_version = "1.0"
+        master_seed = (
+            request.seed if request.seed is not None else secrets.randbits(64)
+        )
 
-        # Build static recipe (retry 0 only — animation quality drives retries).
+        # Build the base static recipe once. Animation retries preserve this
+        # artwork identity and only resample animation-specific decisions.
         candidate_seed = derive_candidate_seed(
             master_seed=master_seed,
             generator_name=generator.name,
             retry_index=0,
-            schema_version=schema_version,
+            schema_version=RECIPE_SCHEMA_VERSION,
         )
         static_streams = RandomStreams.from_seed(candidate_seed)
         static_recipe, static_trait_probs = generator.build_recipe(
@@ -168,87 +204,134 @@ class AnimationService:
             candidate_seed=candidate_seed,
             retry_index=0,
         )
-        compat_result = self._compat_validator.validate(static_recipe)
-        static_recipe = compat_result.recipe
-        applied_rules = compat_result.applied_rules
+
+        compatibility = self._compat_validator.validate(static_recipe)
+        static_recipe = compatibility.recipe
+        applied_rules = compatibility.applied_rules
         static_rarity = self._rarity_evaluator.evaluate(static_trait_probs)
 
-        # Temporal quality retry loop.
         max_retries = opts.max_animation_retries
         best_result: _CandidateResult | None = None
         best_score = -1.0
-        accepted: _CandidateResult | None = None
+        accepted_result: _CandidateResult | None = None
+
+        base_animation_seed = derive_animation_seed(
+            candidate_seed=candidate_seed,
+            generator_name=generator.name,
+            animation_schema_version=ANIMATION_SCHEMA_VERSION,
+        )
 
         for retry_index in range(max_retries + 1):
-            animation_seed = derive_animation_seed(
-                candidate_seed=candidate_seed,
-                generator_name=generator.name,
-                animation_schema_version="1.0",
-            )
+            animation_seed = base_animation_seed
             if retry_index > 0:
                 animation_seed = derive_animation_retry_seed(
-                    animation_seed=animation_seed,
+                    animation_seed=base_animation_seed,
                     retry_index=retry_index,
                 )
 
-            anim_streams = AnimationStreams.from_seed(animation_seed)
-            animation_recipe, anim_trait_probs = renderer.build_animation_recipe(
-                static_recipe, opts, anim_streams, animation_seed
+            animation_streams = AnimationStreams.from_seed(animation_seed)
+            animation_recipe, animation_trait_probs = (
+                renderer.build_animation_recipe(
+                    static_recipe,
+                    opts,
+                    animation_streams,
+                    animation_seed,
+                )
             )
-            animation_rarity = self._rarity_evaluator.evaluate(anim_trait_probs)
 
+            # Builders currently create retry_index=0. The service owns retry
+            # orchestration, so it records the real attempt on the frozen recipe.
+            animation_recipe = replace(
+                animation_recipe,
+                retry_index=retry_index,
+            )
+
+            animation_rarity = self._rarity_evaluator.evaluate(
+                animation_trait_probs
+            )
             frames = self._render_all_frames(renderer, animation_recipe)
-            virtual_p1 = renderer.render_frame(animation_recipe, 0.0)
-            temporal_quality = self._temporal_evaluator.evaluate(
-                frames, virtual_phase1=virtual_p1
+
+            # Phase 1.0 is not encoded as a duplicate frame, but rendering it here
+            # verifies that the mathematical path closes back onto phase 0.0.
+            virtual_phase0 = np.ascontiguousarray(
+                renderer.render_frame(animation_recipe, 0.0)
+            )
+            virtual_phase1 = np.ascontiguousarray(
+                renderer.render_frame(animation_recipe, 1.0)
+            )
+
+            temporal_quality = evaluator.evaluate(
+                frames,
+                virtual_phase0=virtual_phase0,
+                virtual_phase1=virtual_phase1,
+            )
+
+            current_result = _CandidateResult(
+                animation_recipe=animation_recipe,
+                animation_trait_probs=animation_trait_probs,
+                animation_rarity=animation_rarity,
+                frames=frames,
+                temporal_quality=temporal_quality,
             )
 
             if temporal_quality.aggregate_score > best_score:
                 best_score = temporal_quality.aggregate_score
-                best_result = _CandidateResult(
-                    animation_recipe=animation_recipe,
-                    anim_trait_probs=anim_trait_probs,
-                    animation_rarity=animation_rarity,
-                    frames=frames,
-                    temporal_quality=temporal_quality,
-                )
+                best_result = current_result
 
-            if temporal_quality.accepted:
-                accepted = best_result
+            rarity_accepted = self._rarity_is_accepted(
+                actual_tier=animation_rarity.overall_tier,
+                minimum_tier=opts.min_animation_rarity_tier,
+            )
+            if temporal_quality.accepted and rarity_accepted:
+                accepted_result = current_result
                 break
 
-        if opts.strict_temporal_quality and accepted is None:
-            reasons = best_result.temporal_quality.rejection_reasons if best_result else ()
+        if accepted_result is None and opts.min_animation_rarity_tier is not None:
             raise QualityRejectionError(
-                f"All {max_retries + 1} animation candidates failed temporal quality. "
-                + " ".join(reasons)
+                "No animation candidate reached the requested minimum rarity "
+                f"tier '{opts.min_animation_rarity_tier}' after "
+                f"{max_retries + 1} attempts."
             )
 
-        final = accepted if accepted is not None else best_result
+        if opts.strict_temporal_quality and accepted_result is None:
+            reasons = (
+                best_result.temporal_quality.rejection_reasons
+                if best_result is not None
+                else ()
+            )
+            details = " ".join(reasons)
+            raise QualityRejectionError(
+                f"All {max_retries + 1} animation candidates failed temporal "
+                f"quality. {details}".strip()
+            )
+
+        final = accepted_result if accepted_result is not None else best_result
         if final is None:
             raise RuntimeError("Animation service produced no candidate result.")
 
-        # Encode GIF.
-        gif_colors = min(max(opts.gif_colors, 2), 256)
-        gif_opts = GifEncodingOptions(
-            gif_colors=gif_colors,
+        gif_options = GifEncodingOptions(
+            gif_colors=opts.gif_colors,
             dither=opts.gif_dither,
             loop_count=opts.loop_count,
         )
-        encoder = GifEncoder(gif_opts)
+        encoder = GifEncoder(gif_options)
         gif_bytes = encoder.encode(
             final.frames,
             frame_duration_ms=final.animation_recipe.frame_duration_ms,
         )
 
-        # Compute content ID.
-        content_id = compute_animation_content_id(final.animation_recipe, final.frames)
+        content_id = compute_animation_content_id(
+            final.animation_recipe,
+            final.frames,
+        )
 
-        # Write GIF atomically.
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        gif_path = self._write_gif(gif_bytes, output_path, overwrite=request.overwrite)
+        gif_path = self._write_gif(
+            gif_bytes,
+            output_path,
+            overwrite=request.overwrite,
+        )
 
-        # Write manifest.
         metadata_path: Path | None = None
         if opts.write_metadata:
             manifest = build_animation_manifest(
@@ -258,17 +341,22 @@ class AnimationService:
                 temporal_quality=final.temporal_quality,
                 applied_rules=applied_rules,
                 gif_path=gif_path,
-                gif_colors=gif_colors,
+                gif_colors=opts.gif_colors,
                 gif_dither=opts.gif_dither,
                 content_id=content_id,
             )
             metadata_path = self._manifest_writer.write(
-                manifest, gif_path, overwrite=request.overwrite
+                manifest,
+                gif_path,
+                overwrite=request.overwrite,
             )
 
         return AnimationResult(
             output_path=gif_path,
-            size=ImageSize(width=static_recipe.width, height=static_recipe.height),
+            size=ImageSize(
+                width=static_recipe.width,
+                height=static_recipe.height,
+            ),
             generator_name=generator.name,
             master_seed=master_seed,
             animation_seed=final.animation_recipe.animation_seed,
@@ -285,17 +373,18 @@ class AnimationService:
             content_id=content_id,
         )
 
-    # ──────────────────────────────────────────────────────────────────────────
-
     def _render_all_frames(
         self,
         renderer: AnimatedRecipeRenderer,
         animation_recipe: AnimationRecipe,
     ) -> list[UInt8Array]:
+        """Render every encoded phase without adding a duplicate endpoint."""
         phases = generate_frame_phases(animation_recipe.frame_count)
         return [
-            np.ascontiguousarray(renderer.render_frame(animation_recipe, p))
-            for p in phases
+            np.ascontiguousarray(
+                renderer.render_frame(animation_recipe, phase)
+            )
+            for phase in phases
         ]
 
     def _write_gif(
@@ -305,99 +394,168 @@ class AnimationService:
         *,
         overwrite: bool,
     ) -> Path:
-        """Write GIF bytes atomically, return the final path."""
+        """Write GIF bytes through a temporary file and return the final path."""
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=output_path.parent, suffix=".gif.tmp")
+        file_descriptor, temporary_path = tempfile.mkstemp(
+            dir=output_path.parent,
+            suffix=".gif.tmp",
+        )
+
         try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(gif_bytes)
-                f.flush()
-                os.fsync(f.fileno())
+            with os.fdopen(file_descriptor, "wb") as output_file:
+                output_file.write(gif_bytes)
+                output_file.flush()
+                os.fsync(output_file.fileno())
+
             if output_path.exists() and overwrite:
                 output_path.unlink()
-            os.replace(tmp, output_path)
+            os.replace(temporary_path, output_path)
         except Exception:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            with suppress(OSError):
+                os.unlink(temporary_path)
             raise
+
         return output_path
 
     def _validate_request(self, request: AnimationRequest) -> None:
-        opts = request.options
-        if opts.frame_count < _MIN_FRAMES:
+        """Validate dimensions and animation-specific safety constraints."""
+        options = request.options
+        width = request.size.width
+        height = request.size.height
+
+        if not self._settings.min_width <= width <= self._settings.max_width:
             raise OptionsValidationError(
-                f"frame_count must be >= {_MIN_FRAMES}, got {opts.frame_count}"
+                f"width must be between {self._settings.min_width} and "
+                f"{self._settings.max_width}, got {width}"
             )
-        if opts.frame_count > _MAX_FRAMES:
+        if not self._settings.min_height <= height <= self._settings.max_height:
             raise OptionsValidationError(
-                f"frame_count must be <= {_MAX_FRAMES}, got {opts.frame_count}"
+                f"height must be between {self._settings.min_height} and "
+                f"{self._settings.max_height}, got {height}"
             )
-        if opts.fps < _MIN_FPS:
+
+        if options.frame_count < _MIN_FRAMES:
             raise OptionsValidationError(
-                f"fps must be >= {_MIN_FPS}, got {opts.fps}"
+                f"frame_count must be >= {_MIN_FRAMES}, got {options.frame_count}"
             )
-        if opts.fps > _MAX_FPS:
+        if options.frame_count > _MAX_FRAMES:
             raise OptionsValidationError(
-                f"fps must be <= {_MAX_FPS}, got {opts.fps}"
+                f"frame_count must be <= {_MAX_FRAMES}, got {options.frame_count}"
             )
-        if opts.gif_colors not in (64, 128, 256):
+        if options.fps < _MIN_FPS:
             raise OptionsValidationError(
-                f"gif_colors must be 64, 128, or 256, got {opts.gif_colors}"
+                f"fps must be >= {_MIN_FPS}, got {options.fps}"
             )
-        if opts.gif_dither not in ("none", "floyd-steinberg"):
+        if options.fps > _MAX_FPS:
             raise OptionsValidationError(
-                f"gif_dither must be 'none' or 'floyd-steinberg', got {opts.gif_dither!r}"
+                f"fps must be <= {_MAX_FPS}, got {options.fps}"
             )
-        pixel_budget = (
-            request.size.width * request.size.height * opts.frame_count
-        )
+        if options.gif_colors not in (64, 128, 256):
+            raise OptionsValidationError(
+                "gif_colors must be 64, 128, or 256, "
+                f"got {options.gif_colors}"
+            )
+        if options.gif_dither not in ("none", "floyd-steinberg"):
+            raise OptionsValidationError(
+                "gif_dither must be 'none' or 'floyd-steinberg', "
+                f"got {options.gif_dither!r}"
+            )
+        if options.loop_count < 0:
+            raise OptionsValidationError(
+                "loop_count must be >= 0 (0 means infinite), "
+                f"got {options.loop_count}"
+            )
+        if options.max_animation_retries < 0:
+            raise OptionsValidationError(
+                "max_animation_retries must be >= 0, "
+                f"got {options.max_animation_retries}"
+            )
+        if options.max_animation_retries > _MAX_ANIMATION_RETRIES:
+            raise OptionsValidationError(
+                "max_animation_retries must be <= "
+                f"{_MAX_ANIMATION_RETRIES}, got "
+                f"{options.max_animation_retries}"
+            )
+        if (
+            options.motion_intensity is not None
+            and not 0.0 <= options.motion_intensity <= 1.0
+        ):
+            raise OptionsValidationError(
+                "motion_intensity must be between 0.0 and 1.0"
+            )
+        if (
+            options.temporal_quality_threshold is not None
+            and not 0.0 <= options.temporal_quality_threshold <= 1.0
+        ):
+            raise OptionsValidationError(
+                "temporal_quality_threshold must be between 0.0 and 1.0"
+            )
+        if (
+            options.min_animation_rarity_tier is not None
+            and options.min_animation_rarity_tier not in _RARITY_RANK
+        ):
+            valid_tiers = ", ".join(_RARITY_RANK)
+            raise OptionsValidationError(
+                "min_animation_rarity_tier must be one of: "
+                f"{valid_tiers}"
+            )
+
+        pixel_budget = width * height * options.frame_count
         if pixel_budget > _MAX_PIXEL_BUDGET:
             raise OptionsValidationError(
                 f"Animation pixel budget {pixel_budget:,} exceeds maximum "
-                f"{_MAX_PIXEL_BUDGET:,} (reduce width, height, or frame_count)."
+                f"{_MAX_PIXEL_BUDGET:,}. Reduce width, height, or frame_count."
             )
-        if opts.motion_profile is not None:
-            valid = ALL_PROFILES_BY_GENERATOR.get(request.generator_name, ())
-            if opts.motion_profile not in valid:
-                valid_str = ", ".join(valid) if valid else "(none)"
+
+        if options.motion_profile is not None:
+            valid_profiles = ALL_PROFILES_BY_GENERATOR.get(
+                request.generator_name,
+                (),
+            )
+            if options.motion_profile not in valid_profiles:
+                valid_text = ", ".join(valid_profiles) or "(none)"
                 raise OptionsValidationError(
-                    f"motion_profile {opts.motion_profile!r} is not valid for "
-                    f"'{request.generator_name}'. Valid: {valid_str}"
+                    f"motion_profile {options.motion_profile!r} is not valid for "
+                    f"'{request.generator_name}'. Valid profiles: {valid_text}"
                 )
-        if opts.loop_count < 0:
+
+        if request.seed is not None and request.seed < 0:
             raise OptionsValidationError(
-                f"loop_count must be >= 0 (0 = infinite), got {opts.loop_count}"
-            )
-        if opts.max_animation_retries < 0:
-            raise OptionsValidationError(
-                f"max_animation_retries must be >= 0, got {opts.max_animation_retries}"
+                f"seed must be non-negative, got {request.seed}"
             )
 
     @staticmethod
-    def _static_request(request: AnimationRequest) -> object:
-        """Build a minimal GenerationRequest for static recipe building."""
-        from pixel_forge.core.models.generation_options import GenerationOptions
-        from pixel_forge.core.models.generation_request import GenerationRequest
-
+    def _static_request(request: AnimationRequest) -> GenerationRequest:
+        """Build the request used only for static recipe construction."""
         return GenerationRequest(
             size=request.size,
             generator_name=request.generator_name,
             output_path=request.output_path,
             seed=request.seed,
+            overwrite=request.overwrite,
             options=GenerationOptions(
                 palette_name=request.options.palette_name,
             ),
         )
 
+    @staticmethod
+    def _rarity_is_accepted(
+        *,
+        actual_tier: str,
+        minimum_tier: str | None,
+    ) -> bool:
+        """Return whether the actual rarity satisfies an optional minimum."""
+        if minimum_tier is None:
+            return True
+        return _RARITY_RANK[actual_tier] >= _RARITY_RANK[minimum_tier]
+
 
 class _CandidateResult:
-    """Internal holder for one retry candidate's outputs."""
+    """Internal holder for one fully rendered animation candidate."""
 
     __slots__ = (
         "animation_recipe",
-        "anim_trait_probs",
+        "animation_trait_probs",
         "animation_rarity",
         "frames",
         "temporal_quality",
@@ -405,14 +563,15 @@ class _CandidateResult:
 
     def __init__(
         self,
+        *,
         animation_recipe: AnimationRecipe,
-        anim_trait_probs: list,
-        animation_rarity: object,
+        animation_trait_probs: list[TraitProbability],
+        animation_rarity: RarityResult,
         frames: list[UInt8Array],
-        temporal_quality: object,
+        temporal_quality: TemporalQualityResult,
     ) -> None:
         self.animation_recipe = animation_recipe
-        self.anim_trait_probs = anim_trait_probs
-        self.animation_rarity = animation_rarity  # type: ignore[assignment]
+        self.animation_trait_probs = animation_trait_probs
+        self.animation_rarity = animation_rarity
         self.frames = frames
-        self.temporal_quality = temporal_quality  # type: ignore[assignment]
+        self.temporal_quality = temporal_quality

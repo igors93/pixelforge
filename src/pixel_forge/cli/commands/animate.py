@@ -11,7 +11,6 @@ Example:
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
 from pixel_forge.core.models.animation_options import AnimationOptions

@@ -24,10 +24,11 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from numpy.typing import NDArray
 
 from pixel_forge.animation.animation_randomness import AnimationStreams
+from pixel_forge.animation.frame_timing import frame_duration_ms_from_fps
 from pixel_forge.animation.loop_math import (
-    cyclic_cosine,
     cyclic_sine,
     periodic_color_shift,
     periodic_rotation,
@@ -185,7 +186,7 @@ class HarmonicWavesAnimator:
 
         fps = options.fps
         frame_count = options.frame_count
-        frame_duration_ms = round(1000 / fps)
+        frame_duration_ms = frame_duration_ms_from_fps(fps)
 
         recipe = AnimationRecipe(
             animation_schema_version=ANIMATION_SCHEMA_VERSION,
@@ -215,6 +216,9 @@ class HarmonicWavesAnimator:
         phase: float,
     ) -> UInt8Array:
         """Render a single harmonic-waves frame at *phase* ∈ [0.0, 1.0)."""
+        # Phase 1.0 represents the same loop position as phase 0.0.
+        phase = phase % 1.0
+
         from pixel_forge.core.models.image_size import ImageSize
 
         base = animation_recipe.base_recipe
@@ -267,7 +271,10 @@ class HarmonicWavesAnimator:
         # breathing-waves / dual-harmonic: modulate freq_scale.
         if profile == "breathing-waves" or profile == "dual-harmonic":
             freq_mod = smooth_periodic_envelope(
-                phase, cycles=ap.pulse_count, bias=1.0, amplitude=0.25 * animation_recipe.motion_intensity
+                phase,
+                cycles=ap.pulse_count,
+                bias=1.0,
+                amplitude=0.25 * animation_recipe.motion_intensity,
             )
             effective_freq_scale = p.freq_scale * freq_mod
         else:
@@ -295,13 +302,20 @@ class HarmonicWavesAnimator:
         a_warped = np.arctan2(wy, wx)
 
         # Dual-rotation secondary warp.
+        wx2: NDArray[np.float64] | None = None
+        wy2: NDArray[np.float64] | None = None
+
         if ap.dual_rotation:
-            wx2, wy2 = rx2, ry2
+            wx2 = rx2
+            wy2 = ry2
+
             if p.warp_stages >= 1:
-                wx2 = rx2 + p.warp_strength * 0.5 * np.sin(ry2 * p.warp_freq_y + ph[0] - warp_delta)
-                wy2 = ry2 + p.warp_strength * 0.5 * np.cos(rx2 * p.warp_freq_x + ph[1] - warp_delta)
-        else:
-            wx2 = wy2 = None
+                wx2 = rx2 + p.warp_strength * 0.5 * np.sin(
+                    ry2 * p.warp_freq_y + ph[0] - warp_delta
+                )
+                wy2 = ry2 + p.warp_strength * 0.5 * np.cos(
+                    rx2 * p.warp_freq_x + ph[1] - warp_delta
+                )
 
         # ── Frequency set ────────────────────────────────────────────────────
         freq_tuple: tuple[float, ...] = (1.0, 1.618, 1.618 ** 2, 2.0)

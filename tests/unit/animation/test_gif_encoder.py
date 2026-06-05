@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from pixel_forge.animation.frame_timing import quantize_gif_duration_ms
 from pixel_forge.image.encoders.gif_encoder import GifEncoder
 from pixel_forge.image.encoders.gif_encoding_options import GifEncodingOptions
 
@@ -82,9 +83,19 @@ def test_encoded_gif_duration() -> None:
     duration_ms = 83
     encoder = GifEncoder()
     frames = [_gradient_frame(i * 30) for i in range(4)]
-    data = encoder.encode(frames, frame_duration_ms=duration_ms)
+
+    data = encoder.encode(
+        frames,
+        frame_duration_ms=duration_ms,
+    )
+
     img = Image.open(io.BytesIO(data))
-    assert img.info.get("duration") == duration_ms
+
+    expected_duration = quantize_gif_duration_ms(
+        duration_ms
+    )
+
+    assert img.info.get("duration") == expected_duration
 
 
 def test_gif_colors_option_256() -> None:

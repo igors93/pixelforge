@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 
 from pixel_forge.metadata.animation_manifest import AnimationManifest, manifest_to_json
@@ -46,10 +47,8 @@ class AnimationManifestWriter:
                 os.fsync(f.fileno())
             os.replace(tmp_path, json_path)
         except Exception:
-            try:
+            with suppress(OSError):
                 os.unlink(tmp_path)
-            except OSError:
-                pass
             raise
 
         return json_path

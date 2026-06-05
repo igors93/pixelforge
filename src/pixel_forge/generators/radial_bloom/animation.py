@@ -22,12 +22,10 @@ from typing import Any
 import numpy as np
 
 from pixel_forge.animation.animation_randomness import AnimationStreams
+from pixel_forge.animation.frame_timing import frame_duration_ms_from_fps
 from pixel_forge.animation.loop_math import (
-    cyclic_cosine,
     cyclic_sine,
-    periodic_color_shift,
     periodic_rotation,
-    smooth_periodic_envelope,
 )
 from pixel_forge.animation.motion_profiles import (
     RADIAL_DEFAULT_PROFILE,
@@ -162,7 +160,7 @@ class RadialBloomAnimator:
 
         fps = options.fps
         frame_count = options.frame_count
-        frame_duration_ms = round(1000 / fps)
+        frame_duration_ms = frame_duration_ms_from_fps(fps)
 
         recipe = AnimationRecipe(
             animation_schema_version=ANIMATION_SCHEMA_VERSION,

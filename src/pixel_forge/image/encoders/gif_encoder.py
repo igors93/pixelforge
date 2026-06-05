@@ -23,11 +23,11 @@ Limitations:
 from __future__ import annotations
 
 import io
-from typing import Iterator
 
 import numpy as np
 from PIL import Image
 
+from pixel_forge.animation.frame_timing import quantize_gif_duration_ms
 from pixel_forge.generators.common.types import UInt8Array
 from pixel_forge.image.encoders.gif_encoding_options import GifEncodingOptions
 
@@ -73,12 +73,17 @@ class GifEncoder:
 
         # Encode to GIF bytes.
         buf = io.BytesIO()
+
+        encoded_duration_ms = quantize_gif_duration_ms(
+            frame_duration_ms
+        )
+
         pil_frames[0].save(
             buf,
             format="GIF",
             save_all=True,
             append_images=pil_frames[1:],
-            duration=frame_duration_ms,
+            duration=encoded_duration_ms,
             loop=self._opts.loop_count,
             disposal=2,
             optimize=False,
@@ -124,4 +129,4 @@ class GifEncoder:
     ) -> Image.Image:
         """Apply the global palette to one frame and return a mode-P PIL image."""
         pil = Image.fromarray(frame.astype(np.uint8), "RGB")
-        return pil.quantize(palette=palette_img, dither=int(dither_mode))
+        return pil.quantize(palette=palette_img, dither=dither_mode)

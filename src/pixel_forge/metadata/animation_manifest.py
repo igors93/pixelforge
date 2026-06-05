@@ -19,9 +19,9 @@ from typing import Any
 from pixel_forge import __version__
 from pixel_forge.core.models.animation_recipe import ANIMATION_SCHEMA_VERSION, AnimationRecipe
 from pixel_forge.core.models.artwork_recipe import RECIPE_SCHEMA_VERSION, ArtworkRecipe
+from pixel_forge.core.models.rarity_result import RarityResult
 from pixel_forge.core.models.temporal_quality_result import TemporalQualityResult
 from pixel_forge.generators.common.types import UInt8Array
-from pixel_forge.core.models.rarity_result import RarityResult
 
 
 @dataclass(frozen=True, slots=True)

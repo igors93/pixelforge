@@ -31,7 +31,7 @@ def test_phases_evenly_spaced() -> None:
     n = 10
     phases = generate_frame_phases(n)
     expected = [i / n for i in range(n)]
-    for got, exp in zip(phases, expected):
+    for got, exp in zip(phases, expected, strict=True):
         assert abs(got - exp) < 1e-12
 
 

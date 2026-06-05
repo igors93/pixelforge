@@ -6,14 +6,13 @@ These tests invoke the full pipeline end-to-end: CLI parsing → AnimationServic
 
 from __future__ import annotations
 
-import io
 import json
 from pathlib import Path
 
-import numpy as np
 import pytest
 from PIL import Image
 
+from pixel_forge.animation.frame_timing import frame_duration_ms_from_fps
 from pixel_forge.cli.main import main
 
 
@@ -102,8 +101,11 @@ def test_gif_loop_count_infinite(tmp_path: Path) -> None:
 def test_gif_duration_matches_fps(tmp_path: Path) -> None:
     fps = 12
     output = _animate(tmp_path, fps=fps)
+
     img = Image.open(output)
-    expected_ms = round(1000 / fps)
+
+    expected_ms = frame_duration_ms_from_fps(fps)
+
     assert img.info.get("duration") == expected_ms
 
 

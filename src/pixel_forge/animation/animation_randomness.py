@@ -21,7 +21,6 @@ import struct
 
 import numpy as np
 
-
 # Stable spawn-order names for animation-specific streams.
 # Append only — never reorder — to preserve existing animation seeds.
 _ANIMATION_STREAM_NAMES: tuple[str, ...] = (
